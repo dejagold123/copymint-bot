@@ -123,7 +123,7 @@ Type `/` in the chat with your bot to see the menu.
 | `/wallets` | Lists the watched wallets |
 | `/watch 0xADDRESS` | Adds one or more wallets to watch, separated by spaces |
 | `/unwatch 0xADDRESS` | Removes a wallet. The last one cannot be removed, so use `/off` to stop |
-| `/minters` | Shows your minter and funder addresses, never the keys |
+| `/minters` | Shows your numbered minter and funder addresses, never the keys |
 | `/balance` | Shows each minter's native balance on every chain |
 | `/cap` | Shows the mint cap per chain. `/cap 4663 0.1` sets one chain, `/cap all 0.05` sets all |
 | `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE]` | Mints a public-mint contract with every minter, without a watched wallet. Quantity defaults to 1. If you leave out the price, it is read from the contract |

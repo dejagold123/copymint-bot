@@ -358,3 +358,67 @@ class Running(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WalletChoice(unittest.TestCase):
+    def three(self):
+        keys = "0x" + "11" * 32 + ",0x" + "22" * 32 + ",0x" + "33" * 32
+        return node(make_bot(MINTER_PRIVATE_KEYS=keys))
+
+    def test_default_is_every_minter(self):
+        b = self.three()
+        b.command_reply("/snipe", [CONTRACT, "1", "0.001", "10m"])
+        self.assertEqual(len(b.snipe_plan["wallets"]), 3)
+        self.assertIn("Minters: all 3", b.snipe_command([CONTRACT, "1", "0.001", "10m"]))
+
+    def test_numbers_pick_minters_and_the_plan_names_them(self):
+        b = self.three()
+        text = b.snipe_command([CONTRACT, "1", "0.001", "10m", "wallets=1,3"])
+        self.assertEqual(b.snipe_plan["wallets"], [b.minters[0].address.lower(), b.minters[2].address.lower()])
+        self.assertIn("2 of 3", text)
+        self.assertIn("#1", text)
+        self.assertIn("#3", text)
+
+    def test_a_space_after_the_comma_and_an_address_both_work(self):
+        b = self.three()
+        b.snipe_command([CONTRACT, "1", "0.001", "wallets=2,", "3", "10m"])
+        self.assertEqual(len(b.snipe_plan["wallets"]), 2)
+        b.snipe_plan = None
+        b.snipe_command([CONTRACT, "1", "0.001", "10m", f"wallets={b.minters[1].address[:10]}"])
+        self.assertEqual(b.snipe_plan["wallets"], [b.minters[1].address.lower()])
+
+    def test_bad_choices_are_refused_and_make_no_plan(self):
+        b = self.three()
+        for spec in ("wallets=4", "wallets=0", "wallets=abc", "wallets=0x1234567890", "wallets="):
+            text = b.snipe_command([CONTRACT, "1", "0.001", "10m", spec])
+            self.assertIn("⚠️", text, spec)
+            self.assertIsNone(b.snipe_plan, spec)
+
+    def test_only_the_chosen_minters_send_and_the_summary_counts_them(self):
+        b = self.three()
+        b.ensure = lambda acct, chain_id, need: True
+        sent = []
+        original = b.rpc.call.side_effect
+
+        def call(chain_id, method, params):
+            if method == "eth_sendRawTransaction":
+                sent.append(params[0])
+                return f"0xtx{len(sent)}"
+            if method == "eth_getTransactionReceipt":
+                return {"status": "0x1", "gasUsed": hex(50_000), "effectiveGasPrice": hex(10**9)}
+            return original(chain_id, method, params)
+
+        b.rpc.call.side_effect = call
+        b.snipe_command([CONTRACT, "1", "0.001", "10m", "wallets=2"])
+        plan = b.snipe_plan
+        plan["fire_at"] = bot.time.time() + 0.3
+        with mock.patch.object(bot, "SNIPE_PREP_SECONDS", 0), mock.patch.object(bot, "notify") as notify, mock.patch.object(bot, "log"):
+            b.run_snipe(plan)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Minters minted: 1 of 1", notify.call_args[0][0])
+
+    def test_minters_are_numbered(self):
+        b = self.three()
+        text = b.command_reply("/minters", [])
+        self.assertIn("1. " + b.minters[0].address, text)
+        self.assertIn("3. " + b.minters[2].address, text)

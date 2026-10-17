@@ -932,11 +932,39 @@ class Bot:
         joined = "".join(blobs)
         return [(sig, layout) for sig, layout in MANUAL_CALLS if selector(sig)[2:] in joined]
 
+    def choose_minters(self, spec):
+        """Minters named by 1-based numbers (as /minters lists them) or addresses. Returns (accounts, error)."""
+        if spec is None or spec.lower() in ("all", "*"):
+            return list(self.minters), None
+        chosen, seen = [], set()
+        for part in re.split(r"[,;\s]+", spec.strip()):
+            if not part:
+                continue
+            match = None
+            if part.isdigit():
+                index = int(part)
+                if not 1 <= index <= len(self.minters):
+                    return None, f"⚠️ There is no minter number {index}. You have {len(self.minters)}. Send /minters to see them."
+                match = self.minters[index - 1]
+            elif part.lower().startswith("0x") and len(part) >= 8:
+                hits = [a for a in self.minters if a.address.lower().startswith(part.lower())]
+                if len(hits) != 1:
+                    return None, f"⚠️ {part} does not match exactly one of your minters. Send /minters to see them."
+                match = hits[0]
+            else:
+                return None, f"⚠️ I could not read \"{part}\" as a minter. Use numbers like wallets=1,3 or addresses."
+            if match.address.lower() not in seen:
+                seen.add(match.address.lower())
+                chosen.append(match)
+        if not chosen:
+            return None, "⚠️ wallets= needs at least one minter, for example wallets=1,3 or wallets=all."
+        return chosen, None
+
     def snipe_call_data(self, signature, layout, qty, minter):
         words = "".join(f"{qty:064x}" if kind == "q" else "0" * 24 + minter[2:].lower() for kind in layout)
         return selector(signature) + words
 
-    def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None):
+    def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None, accounts=None):
         """Work out the mint call, price and gas before the mint opens. Returns (plan, error)."""
         found = [(sig, layout) for sig, layout in self.mint_functions_in(chain_id, contract) if not (sig == "mint()" and qty != 1)]
         if not found:
@@ -966,7 +994,8 @@ class Bot:
                 f"⚠️ The total price {fmt_native(value, chain_id)} is above your cap of {fmt_native(self.cap(chain_id), chain_id)}. "
                 "Raise it with /cap first."
             )
-        first = self.minters[0]
+        accounts = list(accounts or self.minters)
+        first = accounts[0]
         data = self.snipe_call_data(signature, layout, qty, first.address)
         gas_note = "default"
         try:
@@ -989,9 +1018,18 @@ class Bot:
             "attempts": attempts,
             "worst": attempts * gas * fee,
             "others": others,
+            "wallets": [a.address.lower() for a in accounts],
             "state": "planned",
         }
         return plan, None
+
+    def plan_wallets_text(self, plan):
+        wallets = plan.get("wallets") or [a.address.lower() for a in self.minters]
+        if len(wallets) == len(self.minters):
+            return f"all {len(self.minters)}"
+        numbers = {a.address.lower(): i + 1 for i, a in enumerate(self.minters)}
+        names = ", ".join(f"#{numbers.get(w, '?')} {short_address(w)}" for w in wallets)
+        return f"{len(wallets)} of {len(self.minters)} ({names})"
 
     def snipe_plan_text(self, plan):
         chain = self.chains[plan["chain"]]
@@ -1007,7 +1045,7 @@ class Bot:
             f"Contract: {plan['contract']}\n"
             f"Call: {plan['signature']}, {plan['qty']} each, {price}\n"
             + (f"Other mint functions found: {', '.join(plan['others'])}. Add fn=NAME(types) to the command to pick another.\n" if plan.get("others") else "")
-            + f"Minters: {len(self.minters)}\n"
+            + f"Minters: {self.plan_wallets_text(plan)}\n"
             f"Starts in: {seconds}s\n"
             f"Sends at the start, then retries every {self.snipe_retry:g}s for up to {self.snipe_window:g}s, "
             f"at most {plan['attempts']} tries per minter\n"
@@ -1024,6 +1062,7 @@ class Bot:
             "PRICE is per NFT in the chain's coin, or auto to read it from the contract.\n"
             "TIME is a countdown such as 10m, 90s or 1h30m.\n"
             "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
+            "Add wallets=1,3 to use only those minters (numbers as /minters lists them), or wallets=all. Default is all.\n"
             "Then /snipe confirm to arm it, or /snipe cancel."
         )
         if not args:
@@ -1054,10 +1093,26 @@ class Bot:
         if self.snipe_plan and self.snipe_plan["state"] == "armed":
             return "A snipe is already armed. Send /snipe cancel first."
         override = None
+        wallet_spec = None
         for token in list(args):
             if token.lower().startswith("fn="):
                 override = token[3:]
                 args.remove(token)
+        for index, token in enumerate(list(args)):
+            lowered = token.lower()
+            if lowered.startswith(("wallets=", "wallet=", "w=")):
+                end = index + 1
+                spec = token.split("=", 1)[1]
+                # Allow "wallets=1, 3": a trailing comma pulls in the next word.
+                while spec.endswith(",") and end < len(args):
+                    spec += args[end]
+                    end += 1
+                wallet_spec = spec
+                del args[index:end]
+                break
+        accounts, error = self.choose_minters(wallet_spec)
+        if error:
+            return error
         if len(args) >= 2 and args[-2].lower() == "in":
             delay, args = parse_countdown(args[-2:]), args[:-2]
         else:
@@ -1102,7 +1157,7 @@ class Bot:
         if not code_at or code_at in ("0x", "0x0"):
             return "⚠️ There is no contract at that address on this chain."
         try:
-            plan, error = self.build_snipe_plan(chain_id, contract, qty, price_wei, delay, override)
+            plan, error = self.build_snipe_plan(chain_id, contract, qty, price_wei, delay, override, accounts)
         except Exception as exc:
             log(f"snipe plan {type(exc).__name__}: {exc}")
             return "⚠️ Could not prepare the plan. Try again."
@@ -1193,7 +1248,8 @@ class Bot:
         try:
             fee, tip = self.fees(chain_id)
             active = []
-            for acct in self.minters:
+            chosen = [a for a in self.minters if a.address.lower() in set(plan.get("wallets") or [x.address.lower() for x in self.minters])]
+            for acct in chosen:
                 if self.snipe_cancel.is_set():
                     return
                 if self.ensure(acct, chain_id, plan["value"] + plan["gas"] * fee * 3):
@@ -1225,7 +1281,7 @@ class Bot:
                         for job in jobs:
                             job.result()
             tx = {"hash": f"snipe-{int(plan['fire_at'])}", "from": "manual", "to": contract}
-            self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report}, kind="snipe")
+            self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report, "total": len(chosen)}, kind="snipe")
         except Exception as exc:
             log(f"snipe {type(exc).__name__}: {exc}")
             notify(f"⚠️ Snipe failed: {type(exc).__name__}")
@@ -1305,7 +1361,7 @@ class Bot:
         if command == "/unwatch":
             return self.unwatch_command(args)
         if command == "/minters":
-            lines = [f"👛 minter {account.address}" for account in self.minters]
+            lines = [f"👛 {number}. {account.address}" for number, account in enumerate(self.minters, 1)]
             if self.funder:
                 lines.append(f"🏦 funder {self.funder.address}")
             return "\n".join(lines) or "📭 No minter wallets configured."
@@ -1772,7 +1828,7 @@ class Bot:
         """One Telegram message for a finished mint: who copied, who didn't, why, and what it cost."""
         chain = self.chains[chain_id]
         report = item.get("report") or {}
-        total = len(self.minters)
+        total = int(item.get("total") or len(self.minters))
         minted = [r for r in report.values() if r.get("status") == "minted"]
         dry = [r for r in report.values() if r.get("status") == "dry"]
         quiet = [r for r in report.values() if r.get("status") == "quiet"]
