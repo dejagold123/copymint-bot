@@ -422,3 +422,33 @@ class WalletChoice(unittest.TestCase):
         text = b.command_reply("/minters", [])
         self.assertIn("1. " + b.minters[0].address, text)
         self.assertIn("3. " + b.minters[2].address, text)
+
+
+class ShortForm(unittest.TestCase):
+    def test_quantity_and_price_are_optional(self):
+        b = node(make_bot(), price=10**15)
+        text = b.snipe_command([CONTRACT, "42m", "wallets=1"])
+        self.assertIn("Snipe plan", text)
+        self.assertEqual(b.snipe_plan["qty"], 1)
+        self.assertEqual(b.snipe_plan["value"], 10**15)
+        self.assertEqual(b.snipe_plan["wallets"], [b.minters[0].address.lower()])
+
+    def test_a_number_before_the_contract_is_the_quantity_when_it_is_not_a_chain(self):
+        b = node(make_bot(), price=10**15)
+        b.snipe_command(["2", CONTRACT, "42m", "wallets=1"])
+        self.assertEqual(b.snipe_plan["qty"], 2)
+        self.assertEqual(b.snipe_plan["chain"], 4663)
+
+    def test_the_countdown_can_come_before_the_contract_and_the_long_form_still_works(self):
+        b = node(make_bot(), price=10**15)
+        b.snipe_command(["in", "20m", CONTRACT])
+        self.assertEqual(b.snipe_plan["qty"], 1)
+        b.snipe_plan = None
+        b.snipe_command(["4663", CONTRACT, "3", "0.001", "10m"])
+        self.assertEqual((b.snipe_plan["qty"], b.snipe_plan["value"]), (3, 3 * 10**15))
+
+    def test_stray_words_are_refused(self):
+        b = node(make_bot(), price=10**15)
+        text = b.snipe_command(["1", CONTRACT, "42m", "Add", "wallets=1"])
+        self.assertIn("⚠️", text)
+        self.assertIsNone(b.snipe_plan)

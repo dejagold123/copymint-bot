@@ -1058,10 +1058,11 @@ class Bot:
     def snipe_command(self, args):
         args = list(args)
         usage = (
-            "✏️ Usage: /snipe [CHAIN_ID] 0xCONTRACT QTY PRICE TIME\n"
-            "PRICE is per NFT in the chain's coin, or auto to read it from the contract.\n"
+            "✏️ Usage: /snipe [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] TIME [wallets=1,3]\n"
+            "QTY defaults to 1. PRICE is per NFT in the chain's coin and defaults to auto, which reads it from the contract.\n"
             "TIME is a countdown such as 10m, 90s or 1h30m.\n"
             "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
+            "Shortest form: /snipe 0xabc… 42m wallets=1\n"
             "Add wallets=1,3 to use only those minters (numbers as /minters lists them), or wallets=all. Default is all.\n"
             "Then /snipe confirm to arm it, or /snipe cancel."
         )
@@ -1113,38 +1114,51 @@ class Bot:
         accounts, error = self.choose_minters(wallet_spec)
         if error:
             return error
-        if len(args) >= 2 and args[-2].lower() == "in":
-            delay, args = parse_countdown(args[-2:]), args[:-2]
-        else:
-            delay, args = parse_countdown(args[-1:]), args[:-1]
+        delay = None
+        for index, token in enumerate(args):
+            if token.lower() == "in":
+                continue
+            seconds = parse_countdown([token])
+            if seconds is not None:
+                first = index - 1 if index and args[index - 1].lower() == "in" else index
+                delay = seconds
+                del args[first : index + 1]
+                break
         if delay is None:
             return "⚠️ I could not read the countdown.\n" + usage
         if delay < SNIPE_PREP_SECONDS + 10:
             return "⚠️ The countdown must be at least 15 seconds."
+        position = next((i for i, token in enumerate(args) if valid_address(token)), None)
+        if position is None:
+            return "⚠️ I could not find a valid contract address.\n" + usage
+        contract = valid_address(args[position])
+        before, after = args[:position], args[position + 1 :]
         chain_id = None
-        if args and args[0].isdigit():
-            chain_id = int(args.pop(0))
-            if chain_id not in self.chains:
-                return f"⚠️ Chain {chain_id} is not enabled."
-        elif len(self.chains) == 1:
-            chain_id = next(iter(self.chains))
-        else:
-            return "⚠️ Start with the chain ID, for example /snipe 4663 0xabc… 1 0.001 10m"
-        if len(args) < 3:
-            return usage
-        contract = valid_address(args[0])
-        if contract is None:
-            return "⚠️ That is not a valid contract address.\n" + usage
+        if before and before[0].isdigit() and int(before[0]) in self.chains:
+            chain_id = int(before.pop(0))
+        if len(before) > 1 or len(after) > 2:
+            return "⚠️ I did not understand part of that command.\n" + usage
+        qty_text = before[0] if before else None
+        if after:
+            if qty_text is not None:
+                return "⚠️ Give the quantity once.\n" + usage
+            qty_text = after[0]
+        price_text = after[1] if len(after) > 1 else "auto"
+        if chain_id is None:
+            if len(self.chains) == 1:
+                chain_id = next(iter(self.chains))
+            else:
+                return "⚠️ Start with the chain ID, for example /snipe 4663 0xabc… 1 0.001 10m"
         try:
-            qty = int(args[1])
+            qty = int(qty_text) if qty_text is not None else 1
         except ValueError:
             return "⚠️ Quantity must be a whole number.\n" + usage
         if not 1 <= qty <= MAX_MANUAL_QTY:
             return f"⚠️ Quantity must be between 1 and {MAX_MANUAL_QTY}."
         price_wei = None
-        if args[2].lower() != "auto":
+        if price_text.lower() != "auto":
             try:
-                price = Decimal(args[2])
+                price = Decimal(price_text)
             except Exception:
                 return "⚠️ Price must be a number, or auto.\n" + usage
             if not price.is_finite() or price < 0:
