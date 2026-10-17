@@ -105,7 +105,7 @@ class Command(unittest.TestCase):
 
     def test_with_several_chains_the_chain_is_required(self):
         b = node(make_bot(CHAINS="1,4663"))
-        self.assertIn("chain ID", self.reply(b, [CONTRACT]))
+        self.assertIn("chain=", self.reply(b, [CONTRACT]))
 
     def test_bad_input_is_refused_without_starting_anything(self):
         b = node(make_bot())
@@ -160,6 +160,81 @@ class Running(unittest.TestCase):
         with mock.patch.object(bot, "notify"), mock.patch.object(bot, "log"):
             b.copy(4663, tx, {CONTRACT: 1}, options=options)
         self.assertEqual(seen_options["opts"], options)
+
+
+KEYS3 = "0x" + "11" * 32 + ",0x" + "22" * 32 + ",0x" + "33" * 32
+
+
+class WalletChoice(unittest.TestCase):
+    def three(self, **env):
+        return node(make_bot(MINTER_PRIVATE_KEYS=KEYS3, **env))
+
+    def start(self, b, args):
+        with mock.patch.object(bot.threading, "Thread") as thread:
+            text = b.command_reply("/mint", args)
+        return text, thread
+
+    def test_wallets_pick_the_minters_and_are_passed_on(self):
+        b = self.three()
+        text, thread = self.start(b, [CONTRACT, "2", "wallets=1,3"])
+        self.assertIn("minter #1, #3", text)
+        self.assertEqual(
+            thread.call_args.kwargs["args"],
+            (4663, CONTRACT, 2, None, [b.minters[0].address, b.minters[2].address]),
+        )
+
+    def test_all_or_nothing_passes_no_subset(self):
+        b = self.three()
+        for args in ([CONTRACT], [CONTRACT, "wallets=all"], [CONTRACT, "wallets=1,2,3"]):
+            text, thread = self.start(b, args)
+            self.assertIn("3 minter(s)", text)
+            self.assertEqual(thread.call_args.kwargs["args"], (4663, CONTRACT, 1, None))
+
+    def test_wallets_can_sit_anywhere_and_take_a_space_after_the_comma(self):
+        b = self.three()
+        _text, thread = self.start(b, ["wallets=2,", "3", CONTRACT, "1"])
+        self.assertEqual(len(thread.call_args.kwargs["args"][4]), 2)
+
+    def test_bad_wallets_start_nothing(self):
+        b = self.three()
+        for spec in ("wallets=4", "wallets=0", "wallets=abc", "wallets="):
+            text, thread = self.start(b, [CONTRACT, spec])
+            self.assertIn("⚠️", text, spec)
+            thread.assert_not_called()
+
+    def test_chain_by_name_and_detection_by_where_the_contract_is(self):
+        b = node(make_bot(CHAINS="1,4663"))
+        _text, thread = self.start(b, [CONTRACT, "chain=robinhood"])
+        self.assertEqual(thread.call_args.kwargs["args"][0], 4663)
+        original = b.rpc.call.side_effect
+
+        def call(chain_id, method, params):
+            if method == "eth_getCode" and chain_id == 1:
+                return "0x"
+            return original(chain_id, method, params)
+
+        b.rpc.call.side_effect = call
+        _text, thread = self.start(b, [CONTRACT])
+        self.assertEqual(thread.call_args.kwargs["args"][0], 4663)
+
+    def test_only_the_chosen_minters_are_tried_and_counted(self):
+        b = self.three()
+        tried = []
+
+        def pick(chain_id, acct, options, want):
+            tried.append(acct.address.lower())
+            return (0, CONTRACT, "0x1234abcd", 100_000)
+
+        b.pick = pick
+        b.fees = lambda chain_id: (1, 1)
+        b.ensure = lambda acct, chain_id, need: True
+        b.land = lambda *a, **k: ("0xmine", True, ["x"])
+        tx = {"hash": "manual-9", "from": "manual", "to": CONTRACT, "value": "0x0", "input": "0x"}
+        with mock.patch.object(bot, "notify") as notify, mock.patch.object(bot, "log"):
+            b.copy(4663, tx, {CONTRACT: 1}, options=[(CONTRACT, "0x1234abcd", 0)], wallets=[b.minters[1].address])
+        self.assertEqual(tried, [b.minters[1].address.lower()])
+        self.assertIn("1 of 1", notify.call_args[0][0])
+        self.assertEqual(b.pending, {})
 
 
 if __name__ == "__main__":

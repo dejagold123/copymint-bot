@@ -111,7 +111,7 @@ With the same two variables set, type `/` in the chat with the bot. Telegram sho
 | `/minters` | Shows your minter and funder addresses, never their keys |
 | `/balance` | Shows each minter's native balance on every chain |
 | `/cap` | Shows the mint value cap per chain. `/cap 56 0.1` sets one chain and `/cap all 0.05` sets all |
-| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE]` | Mints a public-mint contract with every minter, without a watched wallet. The chain ID is only needed with several chains. Quantity defaults to 1. The price per NFT is read from the contract if you leave it out. Example: `/mint 4663 0xabc… 2 0.001` |
+| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] [wallets=1,3]` | Mints a public-mint contract with every minter, without a watched wallet. The chain ID is only needed with several chains. Quantity defaults to 1. Add `wallets=1,3` to use only those minters, numbered as `/minters` lists them (default is all), and `chain=robinhood` when several chains are enabled; without it the bot finds the chain by where the contract exists. The price per NFT is read from the contract if you leave it out. Example: `/mint 4663 0xabc… 2 0.001` |
 | `/snipe [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] TIME [wallets=1,3]` | Schedules a timed mint. `PRICE` is per NFT, or `auto` to read it from the contract. `TIME` is a countdown such as `10m`, `90s` or `1h30m`. The bot replies with its plan, and nothing happens until you send `/snipe confirm`. `/snipe cancel` stops it. Example: `/snipe 4663 0xabc… 2 0.001 10m` |
 | `/help` | Lists the commands |
 

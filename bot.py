@@ -849,23 +849,62 @@ class Bot:
             options.append((contract, "0x", value))
         return options
 
+    def pull_option(self, args, prefixes):
+        """Remove a name=value option from args (a trailing comma pulls in the next word). Returns the value or None."""
+        for index, token in enumerate(list(args)):
+            if token.lower().startswith(prefixes):
+                end = index + 1
+                value = token.split("=", 1)[1]
+                while value.endswith(",") and end < len(args):
+                    value += args[end]
+                    end += 1
+                del args[index:end]
+                return value
+        return None
+
     def mint_command(self, args):
         args = list(args)
-        usage = "✏️ Usage: /mint [CHAIN_ID] 0xCONTRACT [QUANTITY] [PRICE_PER_NFT]\nExample: /mint 4663 0xabc… 2 0.001"
+        usage = (
+            "✏️ Usage: /mint [CHAIN_ID] 0xCONTRACT [QUANTITY] [PRICE_PER_NFT] [wallets=1,3]\n"
+            "Example: /mint 4663 0xabc… 2 0.001\n"
+            "Add wallets=1,3 to use only those minters (numbers as /minters lists them). Default is all.\n"
+            "Add chain=robinhood if more than one chain is enabled and the address is on several."
+        )
         if not args:
             return usage
+        wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
+        chain_word = self.pull_option(args, ("chain=", "c="))
+        accounts, error = self.choose_minters(wallet_spec)
+        if error:
+            return error
         chain_id = None
-        if args[0].isdigit():
+        if chain_word is not None:
+            chain_id = self.chain_from_word(chain_word)
+            if chain_id is None:
+                names = ", ".join(f"{c.name} ({cid})" for cid, c in self.chains.items())
+                return f"⚠️ I do not know the chain \"{chain_word}\". Enabled chains: {names}."
+        elif args and args[0].isdigit():
             chain_id = int(args.pop(0))
             if chain_id not in self.chains:
                 return f"⚠️ Chain {chain_id} is not enabled."
-        elif len(self.chains) == 1:
-            chain_id = next(iter(self.chains))
-        else:
-            return "⚠️ Start with the chain ID, for example /mint 4663 0xabc… 1"
+        if chain_word is not None and args and args[0].isdigit() and int(args[0]) in self.chains and len(args) > 1 and valid_address(args[1]):
+            args.pop(0)
         contract = valid_address(args[0]) if args else None
         if contract is None:
             return "⚠️ That is not a valid contract address.\n" + usage
+        if chain_id is None:
+            if len(self.chains) == 1:
+                chain_id = next(iter(self.chains))
+            else:
+                found_on = [cid for cid in self.chains if self.has_code(cid, contract)]
+                if len(found_on) == 1:
+                    chain_id = found_on[0]
+                elif not found_on:
+                    names = ", ".join(c.name for c in self.chains.values())
+                    return f"⚠️ I could not find a contract at that address on any enabled chain ({names}). Check the address, or add chain=NAME."
+                else:
+                    names = ", ".join(self.chains[cid].name for cid in found_on)
+                    return f"⚠️ That address has a contract on several chains ({names}). Add chain=NAME, for example chain=robinhood."
         try:
             qty = int(args[1]) if len(args) > 1 else 1
         except ValueError:
@@ -887,14 +926,20 @@ class Bot:
             return "⚠️ Could not reach the chain's RPC. Try again."
         if not code_at or code_at in ("0x", "0x0"):
             return "⚠️ There is no contract at that address on this chain."
-        threading.Thread(target=self.run_manual_mint, args=(chain_id, contract, qty, price_wei), daemon=True).start()
+        job = (chain_id, contract, qty, price_wei)
+        if len(accounts) != len(self.minters):
+            job += ([a.address for a in accounts],)
+        threading.Thread(target=self.run_manual_mint, args=job, daemon=True).start()
         mode = " (dry run, nothing will be sent)" if self.dry else ""
+        who = f"{len(self.minters)} minter(s)" if len(accounts) == len(self.minters) else "minter " + ", ".join(
+            f"#{self.minters.index(a) + 1}" for a in accounts
+        )
         return (
-            f"🎟 Minting {qty} from {contract} on {self.chains[chain_id].name} with {len(self.minters)} minter(s){mode}.\n"
+            f"🎟 Minting {qty} from {contract} on {self.chains[chain_id].name} with {who}{mode}.\n"
             "A summary follows when it is done."
         )
 
-    def run_manual_mint(self, chain_id, contract, qty, price_wei):
+    def run_manual_mint(self, chain_id, contract, qty, price_wei, wallets=None):
         try:
             options = self.manual_options(chain_id, contract, qty, price_wei)
             tx = {
@@ -905,7 +950,7 @@ class Bot:
                 "input": "0x",
             }
             with self._copy_lock:
-                self.copy(chain_id, tx, {contract: qty}, options=options)
+                self.copy(chain_id, tx, {contract: qty}, options=options, wallets=wallets)
         except Exception as exc:
             log(f"/mint {contract} {type(exc).__name__}: {exc}")
             notify(f"⚠️ /mint failed: {type(exc).__name__}")
@@ -2155,7 +2200,7 @@ class Bot:
             )
         return None
 
-    def copy(self, chain_id, tx, want, options=None):
+    def copy(self, chain_id, tx, want, options=None, wallets=None):
         key = f"{chain_id}:{tx['hash']}"
         if key in self.seen:
             return
@@ -2171,6 +2216,10 @@ class Bot:
             "done": [],
             "inflight": {},
         }
+        if wallets is not None and not item.get("wallets"):
+            item["wallets"] = [w.lower() for w in wallets]
+        accounts = [a for a in self.minters if not item.get("wallets") or a.address.lower() in item["wallets"]]
+        item["total"] = len(accounts)
         if options is not None and not item.get("options"):
             item["options"] = [list(option) for option in options]
         if item.get("options"):
@@ -2193,7 +2242,7 @@ class Bot:
         done = set(a.lower() for a in item.get("done") or [])
         inflight = item.get("inflight") or {}
         report = item.setdefault("report", {})
-        for acct in self.minters:
+        for acct in accounts:
             who = acct.address.lower()
             if who in done:
                 continue
@@ -2256,7 +2305,7 @@ class Bot:
                 log(f"pending {acct.address} {txh}")
         item["done"] = sorted(done)
         item["inflight"] = inflight
-        if len(done) == len(self.minters) or not temporary:
+        if len(done) == len(accounts) or not temporary:
             self.send_summary(chain_id, tx, want, item)
             self.seen.add(key)
             self.pending.pop(key, None)

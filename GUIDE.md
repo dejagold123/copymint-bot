@@ -126,7 +126,7 @@ Type `/` in the chat with your bot to see the menu.
 | `/minters` | Shows your numbered minter and funder addresses, never the keys |
 | `/balance` | Shows each minter's native balance on every chain |
 | `/cap` | Shows the mint cap per chain. `/cap 4663 0.1` sets one chain, `/cap all 0.05` sets all |
-| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE]` | Mints a public-mint contract with every minter, without a watched wallet. Quantity defaults to 1. If you leave out the price, it is read from the contract |
+| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] [wallets=1,3]` | Mints a public-mint contract with every minter (or only the numbered ones in `wallets=`, as `/minters` lists them), without a watched wallet. Quantity defaults to 1. If you leave out the price, it is read from the contract |
 | `/help` | Lists the commands |
 
 Notes:
