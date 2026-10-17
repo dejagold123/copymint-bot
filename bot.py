@@ -932,6 +932,25 @@ class Bot:
         joined = "".join(blobs)
         return [(sig, layout) for sig, layout in MANUAL_CALLS if selector(sig)[2:] in joined]
 
+    def has_code(self, chain_id, contract):
+        """True or False if the chain says whether a contract is there, None if the RPC could not answer."""
+        try:
+            code = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"])
+        except Exception:
+            return None
+        return bool(code) and code not in ("0x", "0x0")
+
+    def chain_from_word(self, word):
+        """A chain ID or name (robinhood, eth) typed by the user, as an enabled chain ID or None."""
+        word = word.strip().lower()
+        if word.isdigit():
+            return int(word) if int(word) in self.chains else None
+        for cid, chain in self.chains.items():
+            name = chain.name.lower()
+            if word == name or (len(word) >= 3 and name.startswith(word)):
+                return cid
+        return None
+
     def choose_minters(self, spec):
         """Minters named by 1-based numbers (as /minters lists them) or addresses. Returns (accounts, error)."""
         if spec is None or spec.lower() in ("all", "*"):
@@ -964,11 +983,52 @@ class Bot:
         words = "".join(f"{qty:064x}" if kind == "q" else "0" * 24 + minter[2:].lower() for kind in layout)
         return selector(signature) + words
 
+    def custom_call(self, chain_id, contract, signature):
+        """A mint function the user named, such as publicMint(uint256), if its call data is simple and it is in the contract."""
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\(([a-z0-9,]*)\)", signature.strip())
+        if not match:
+            return None
+        types = [t for t in match.group(2).split(",") if t]
+        layout = ""
+        for kind in types:
+            if kind == "uint256":
+                layout += "q"
+            elif kind == "address":
+                layout += "a"
+            else:
+                return None
+        if layout.count("q") > 1:
+            return None
+        try:
+            code = (self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"]) or "").lower()
+        except Exception:
+            return None
+        blobs = [code]
+        try:
+            slot = self.rpc.call(chain_id, "eth_getStorageAt", [to_checksum_address(contract), EIP1967_IMPLEMENTATION_SLOT, "latest"])
+            if slot and int(slot, 16):
+                blobs.append((self.rpc.call(chain_id, "eth_getCode", [to_checksum_address("0x" + slot[-40:]), "latest"]) or "").lower())
+        except Exception:
+            pass
+        if selector(signature)[2:] not in "".join(blobs):
+            return None
+        return (signature, layout)
+
     def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None, accounts=None):
         """Work out the mint call, price and gas before the mint opens. Returns (plan, error)."""
         found = [(sig, layout) for sig, layout in self.mint_functions_in(chain_id, contract) if not (sig == "mint()" and qty != 1)]
+        if override and not any(sig == override for sig, _ in found):
+            custom = self.custom_call(chain_id, contract, override)
+            if custom:
+                found = [custom]
         if not found:
-            return None, "⚠️ I could not find a standard mint function in that contract, so I cannot prepare it. Use /mint once the mint is open."
+            chain_name = self.chains[chain_id].name
+            return None, (
+                f"⚠️ I could not find a standard mint function in that contract on {chain_name} (chain {chain_id}), so I cannot prepare it.\n"
+                f"If {chain_name} is the wrong chain, add chain=NAME to the command.\n"
+                "If it is the right chain, the contract uses a custom mint function. Add fn=NAME(types) if you know it, "
+                "for example fn=publicMint(uint256), or use /mint once the mint is open."
+            )
         if override:
             matches = [item for item in found if item[0] == override]
             if not matches:
@@ -1063,6 +1123,7 @@ class Bot:
             "TIME is a countdown such as 10m, 90s or 1h30m.\n"
             "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
             "Shortest form: /snipe 0xabc… 42m wallets=1\n"
+            "Add chain=robinhood (or the chain ID) if more than one chain is enabled and the address is on several.\n"
             "Add wallets=1,3 to use only those minters (numbers as /minters lists them), or wallets=all. Default is all.\n"
             "Then /snipe confirm to arm it, or /snipe cancel."
         )
@@ -1111,6 +1172,12 @@ class Bot:
                 wallet_spec = spec
                 del args[index:end]
                 break
+        chain_word = None
+        for index, token in enumerate(list(args)):
+            if token.lower().startswith(("chain=", "c=")):
+                chain_word = token.split("=", 1)[1]
+                del args[index]
+                break
         accounts, error = self.choose_minters(wallet_spec)
         if error:
             return error
@@ -1134,8 +1201,18 @@ class Bot:
         contract = valid_address(args[position])
         before, after = args[:position], args[position + 1 :]
         chain_id = None
-        if before and before[0].isdigit() and int(before[0]) in self.chains:
-            chain_id = int(before.pop(0))
+        if chain_word is not None:
+            chain_id = self.chain_from_word(chain_word)
+            if chain_id is None:
+                names = ", ".join(f"{c.name} ({cid})" for cid, c in self.chains.items())
+                return f"⚠️ I do not know the chain \"{chain_word}\". Enabled chains: {names}."
+        elif before and before[0].isdigit() and int(before[0]) in self.chains:
+            lead = int(before[0])
+            # With one chain the number is the chain. With several it could be the quantity,
+            # so it counts as the chain only if the contract is really on that chain.
+            if len(self.chains) == 1 or self.has_code(lead, contract) is not False:
+                chain_id = lead
+                before.pop(0)
         if len(before) > 1 or len(after) > 2:
             return "⚠️ I did not understand part of that command.\n" + usage
         qty_text = before[0] if before else None
@@ -1148,7 +1225,15 @@ class Bot:
             if len(self.chains) == 1:
                 chain_id = next(iter(self.chains))
             else:
-                return "⚠️ Start with the chain ID, for example /snipe 4663 0xabc… 1 0.001 10m"
+                found_on = [cid for cid in self.chains if self.has_code(cid, contract)]
+                if len(found_on) == 1:
+                    chain_id = found_on[0]
+                elif not found_on:
+                    names = ", ".join(c.name for c in self.chains.values())
+                    return f"⚠️ I could not find a contract at that address on any enabled chain ({names}). Check the address, or add chain=NAME."
+                else:
+                    names = ", ".join(self.chains[cid].name for cid in found_on)
+                    return f"⚠️ That address has a contract on several chains ({names}). Add chain=NAME, for example chain=robinhood."
         try:
             qty = int(qty_text) if qty_text is not None else 1
         except ValueError:

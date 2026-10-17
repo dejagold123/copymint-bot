@@ -142,7 +142,7 @@ class Planning(unittest.TestCase):
 
     def test_with_several_chains_the_chain_is_required(self):
         b = node(make_bot(CHAINS="1,4663"))
-        self.assertIn("chain ID", b.command_reply("/snipe", [CONTRACT, "1", "0", "10m"]))
+        self.assertIn("chain=", b.command_reply("/snipe", [CONTRACT, "1", "0", "10m"]))
 
     def test_it_is_in_the_menu(self):
         self.assertIn("/snipe", make_bot().command_reply("/help"))
@@ -452,3 +452,63 @@ class ShortForm(unittest.TestCase):
         text = b.snipe_command(["1", CONTRACT, "42m", "Add", "wallets=1"])
         self.assertIn("⚠️", text)
         self.assertIsNone(b.snipe_plan)
+
+
+class ChainChoice(unittest.TestCase):
+    def two_chains(self, code_on):
+        b = node(make_bot(CHAINS="1,4663"), price=10**15)
+        original = b.rpc.call.side_effect
+
+        def call(chain_id, method, params):
+            if method == "eth_getCode" and chain_id not in code_on:
+                return "0x"
+            return original(chain_id, method, params)
+
+        b.rpc.call.side_effect = call
+        return b
+
+    def test_the_chain_is_found_by_where_the_contract_is(self):
+        b = self.two_chains({4663})
+        b.snipe_command([CONTRACT, "42m", "wallets=1"])
+        self.assertEqual(b.snipe_plan["chain"], 4663)
+
+    def test_a_leading_one_is_the_quantity_when_the_contract_is_not_on_chain_one(self):
+        b = self.two_chains({4663})
+        b.snipe_command(["1", CONTRACT, "42m", "wallets=1"])
+        self.assertEqual((b.snipe_plan["chain"], b.snipe_plan["qty"]), (4663, 1))
+        b.snipe_plan = None
+        b.snipe_command(["2", CONTRACT, "42m"])
+        self.assertEqual((b.snipe_plan["chain"], b.snipe_plan["qty"]), (4663, 2))
+
+    def test_a_chain_number_still_works_when_the_contract_is_there(self):
+        b = self.two_chains({1, 4663})
+        b.snipe_command(["4663", CONTRACT, "3", "0.001", "10m"])
+        self.assertEqual((b.snipe_plan["chain"], b.snipe_plan["qty"]), (4663, 3))
+
+    def test_chain_by_name_and_unknown_chain(self):
+        b = self.two_chains({1, 4663})
+        b.snipe_command([CONTRACT, "42m", "chain=robinhood"])
+        self.assertEqual(b.snipe_plan["chain"], 4663)
+        b.snipe_plan = None
+        self.assertIn("do not know the chain", b.snipe_command([CONTRACT, "42m", "chain=solana"]))
+
+    def test_no_contract_anywhere_is_said(self):
+        b = self.two_chains(set())
+        self.assertIn("any enabled chain", b.snipe_command([CONTRACT, "42m"]))
+
+    def test_the_error_names_the_chain_and_suggests_fn(self):
+        b = node(make_bot(), code="0x6080")
+        text = b.snipe_command([CONTRACT, "42m"])
+        self.assertIn("on Robinhood (chain 4663)", text)
+        self.assertIn("fn=", text)
+
+    def test_a_named_custom_function_is_used_when_it_is_in_the_contract(self):
+        sig = "claimNow(uint256)"
+        code = "0x6080" + "63" + bot.selector(sig)[2:] + "00"
+        b = node(make_bot(), code=code, price=10**15)
+        text = b.snipe_command([CONTRACT, "2", "42m", f"fn={sig}"])
+        self.assertIn(sig, text)
+        self.assertEqual(b.snipe_plan["layout"], "q")
+        b.snipe_plan = None
+        self.assertIn("⚠️", b.snipe_command([CONTRACT, "2", "42m", "fn=other(uint256)"]))
+        self.assertIn("⚠️", b.snipe_command([CONTRACT, "2", "42m", "fn=weird(bytes)"]))
