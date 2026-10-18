@@ -374,5 +374,48 @@ class Sending(unittest.TestCase):
         self.assertIn("already running", b.command_reply("/sendnfts", [DEST]))
 
 
+class Ids(unittest.TestCase):
+    def test_id_lists_and_ranges_are_parsed(self):
+        self.assertEqual(bot.parse_id_list("5,7,9-11")[0], [5, 7, 9, 10, 11])
+        self.assertEqual(bot.parse_id_list("3,3,2")[0], [3, 2])
+        for bad in ("", "x", "5-2", "1-99999999"):
+            self.assertIsNotNone(bot.parse_id_list(bad)[1], bad)
+
+    def test_ids_need_exactly_one_collection(self):
+        b = make_bot()
+        with mock.patch.object(bot.threading, "Thread") as thread:
+            self.assertIn("exactly one collection", b.command_reply("/sendnfts", [DEST, "ids=1,2"]))
+            self.assertIn("⚠️", b.command_reply("/sendnfts", [DEST, f"collection={C721}", "ids=x"]))
+            thread.assert_not_called()
+            b.command_reply("/sendnfts", [DEST, f"collection={C721}", "ids=1-3"])
+        self.assertEqual(thread.call_args.kwargs["args"][5], [1, 2, 3])
+
+    def test_given_ids_find_tokens_the_collection_cannot_list(self):
+        b = node(make_bot())
+        me = b.minters[0].address.lower()
+        b.fake.enumerable = False
+        b.fake.owner = {(C721, 40): me, (C721, 41): me, (C721, 99): "0x" + "77" * 20}
+        found = b.find_nfts(4663, b.minters[0], extra=[C721], given=list(range(30, 60)))
+        self.assertEqual(found[0]["items"], [(40, 1), (41, 1)])
+        self.assertEqual(found[0]["missing"], 0)
+
+    def test_the_plan_says_why_deep_found_nothing(self):
+        b = node(make_bot())
+        me = b.minters[0].address.lower()
+        b.fake.enumerable = False
+        b.fake.owner = {(C721, 500): me}
+        with mock.patch.object(bot, "notify") as notify:
+            b.prepare_send(DEST, [b.minters[0]], [4663], [C721], True, [])
+        self.assertIn("totalSupply() could not be read", notify.call_args[0][0])
+        b.fake.supply[C721] = bot.DEEP_SCAN_LIMIT + 1
+        with mock.patch.object(bot, "notify") as notify:
+            b.prepare_send(DEST, [b.minters[0]], [4663], [C721], True, [])
+        self.assertIn("above the deep scan limit", notify.call_args[0][0])
+        b.fake.supply[C721] = 10
+        with mock.patch.object(bot, "notify") as notify:
+            b.prepare_send(DEST, [b.minters[0]], [4663], [C721], True, [])
+        self.assertIn("not in that range", notify.call_args[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()

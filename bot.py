@@ -98,6 +98,30 @@ def addr_word(address):
     return "0" * 24 + address[2:].lower()
 
 
+def parse_id_list(text, limit=20000):
+    """Token IDs from text like "5,7,100-120". Returns (ids, error)."""
+    ids, seen = [], set()
+    for part in re.split(r"[,;\s]+", (text or "").strip()):
+        if not part:
+            continue
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not match:
+            return None, f"\"{part}\" is not a token ID or a range like 100-120."
+        low = int(match.group(1))
+        high = int(match.group(2)) if match.group(2) else low
+        if high < low or high - low + 1 > limit:
+            return None, f"The range {part} is empty or longer than {limit}."
+        for token in range(low, high + 1):
+            if token not in seen:
+                seen.add(token)
+                ids.append(token)
+        if len(ids) > limit:
+            return None, f"That is more than {limit} token IDs."
+    if not ids:
+        return None, "ids= needs at least one token ID, for example ids=5,7 or ids=1-500."
+    return ids, None
+
+
 def parse_countdown(tokens):
     """Seconds from text like '10m', '90s', '1h30m' or 'in 10m'. None if it is not a countdown."""
     tokens = list(tokens)
@@ -1554,12 +1578,22 @@ class Bot:
         raw = self.view(chain_id, collection, OWNER_OF + uint_word(token_id))
         return bool(raw) and len(raw) >= 66 and raw[-40:].lower() == wallet[2:].lower()
 
-    def nfts_721(self, chain_id, collection, wallet, recorded, deep):
-        """Token IDs this wallet owns in an ERC-721 collection, and how many more it holds that could not be found."""
+    def check_owned(self, chain_id, collection, wallet, token_ids):
+        """The token IDs from the list that the wallet owns, checked in parallel."""
+        token_ids = list(token_ids)
+        if len(token_ids) < 20:
+            return [t for t in token_ids if self.owns_721(chain_id, collection, t, wallet)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            flags = list(pool.map(lambda t: self.owns_721(chain_id, collection, t, wallet), token_ids))
+        return [t for t, mine in zip(token_ids, flags) if mine]
+
+    def nfts_721(self, chain_id, collection, wallet, recorded, deep, given=()):
+        """Token IDs this wallet owns in an ERC-721 collection, how many more it holds that were not found, and a note on why."""
         balance = self.view_int(chain_id, collection, BALANCE_OF_721 + addr_word(wallet))
         if not balance:
-            return [], 0
-        owned = {int(i) for i in recorded if self.owns_721(chain_id, collection, int(i), wallet)}
+            return [], 0, ""
+        owned = set(self.check_owned(chain_id, collection, wallet, [int(i) for i in list(recorded) + list(given)]))
+        note = ""
         if len(owned) < balance:
             for index in range(balance):
                 token = self.view_int(chain_id, collection, TOKEN_BY_INDEX + addr_word(wallet) + uint_word(index))
@@ -1568,13 +1602,18 @@ class Bot:
                 owned.add(token)
         if len(owned) < balance and deep:
             supply = self.view_int(chain_id, collection, TOTAL_SUPPLY)
-            if supply and supply <= DEEP_SCAN_LIMIT:
+            if not supply:
+                note = "its totalSupply() could not be read, so there is no range to scan; add ids=1-5000 (your own range) to scan one"
+            elif supply > DEEP_SCAN_LIMIT:
+                note = f"it has {supply} NFTs, above the deep scan limit of {DEEP_SCAN_LIMIT}; add ids=FIRST-LAST to scan a range you choose"
+            else:
                 candidates = [i for i in range(0, supply + 2) if i not in owned]
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    for token, mine in zip(candidates, pool.map(lambda i: self.owns_721(chain_id, collection, i, wallet), candidates)):
-                        if mine:
-                            owned.add(token)
-        return sorted(owned), max(0, balance - len(owned))
+                owned.update(self.check_owned(chain_id, collection, wallet, candidates))
+                if len(owned) < balance:
+                    note = f"I checked token IDs 0 to {supply + 1} and the rest are not in that range; add ids=FIRST-LAST for a wider range"
+        elif len(owned) < balance and given:
+            note = "none of the token IDs you gave, or the rest, are owned by this wallet"
+        return sorted(owned), max(0, balance - len(owned)), note
 
     def nfts_1155(self, chain_id, collection, wallet, recorded):
         found = []
@@ -1584,7 +1623,7 @@ class Bot:
                 found.append((int(raw_id), amount))
         return sorted(found)
 
-    def find_nfts(self, chain_id, acct, extra=(), deep=False):
+    def find_nfts(self, chain_id, acct, extra=(), deep=False, given=()):
         """Everything this wallet holds on one chain: a list of dicts with collection, std, items and missing."""
         wallet = acct.address.lower()
         hints = {}
@@ -1601,15 +1640,17 @@ class Bot:
         found = []
         for collection, (std, recorded) in hints.items():
             std = std or self.detect_standard(chain_id, collection, wallet)
+            note = ""
+            extra_ids = list(given) if collection in {c.lower() for c in extra} else []
             if std == 721:
-                ids, missing = self.nfts_721(chain_id, collection, wallet, recorded, deep)
+                ids, missing, note = self.nfts_721(chain_id, collection, wallet, recorded, deep, extra_ids)
                 items = [(i, 1) for i in ids]
             elif std == 1155:
-                items, missing = self.nfts_1155(chain_id, collection, wallet, recorded), 0
+                items, missing = self.nfts_1155(chain_id, collection, wallet, list(recorded) + [str(i) for i in extra_ids]), 0
             else:
                 continue
             if items or missing:
-                found.append({"collection": collection, "std": std, "items": items, "missing": missing})
+                found.append({"collection": collection, "std": std, "items": items, "missing": missing, "note": note})
         return found
 
     def transfer_data(self, std, sender, dest, token_id, amount):
@@ -1627,8 +1668,8 @@ class Bot:
             "Sends every NFT the chosen minters hold (default: all minters, all enabled chains) to the destination.\n"
             "I list what I found and what it will cost, then you send /sendnfts confirm within 2 minutes, or /sendnfts cancel.\n"
             "I know the NFTs your minters minted through this bot since this feature was added. For older NFTs add collection=0xabc… "
-            "(finds them if the collection can list a wallet's tokens) or deep (checks token by token, collections up to "
-            f"{DEEP_SCAN_LIMIT} NFTs)."
+            "(finds them if the collection can list a wallet's tokens), deep (checks token by token, collections up to "
+            f"{DEEP_SCAN_LIMIT} NFTs), or ids=5,7,100-120 with one collection= if you know the token IDs or a range to check."
         )
         if not args:
             return usage
@@ -1664,6 +1705,7 @@ class Bot:
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         chain_word = self.pull_option(args, ("chain=", "c="))
         collection_spec = self.pull_option(args, ("collection=", "collections="))
+        ids_spec = self.pull_option(args, ("ids=", "id="))
         accounts, error = self.choose_minters(wallet_spec)
         if error:
             return error
@@ -1681,6 +1723,13 @@ class Bot:
             if valid_address(part) is None:
                 return f"⚠️ \"{part}\" is not a valid collection address."
             extra.append(valid_address(part))
+        given = []
+        if ids_spec is not None:
+            if len(extra) != 1:
+                return "⚠️ ids= goes with exactly one collection=0x…, so I know which collection the IDs belong to."
+            given, id_error = parse_id_list(ids_spec)
+            if id_error:
+                return "⚠️ " + id_error
         if len(args) != 1:
             return "⚠️ I need exactly one destination address.\n" + usage
         dest = valid_address(args[0])
@@ -1688,10 +1737,10 @@ class Bot:
             return "⚠️ That is not a valid destination address.\n" + usage
         if int(dest, 16) == 0:
             return "⚠️ I will not send NFTs to the zero address."
-        threading.Thread(target=self.prepare_send, args=(dest, accounts, chain_ids, extra, deep), daemon=True).start()
+        threading.Thread(target=self.prepare_send, args=(dest, accounts, chain_ids, extra, deep, given), daemon=True).start()
         return f"🔎 Looking for NFTs in {len(accounts)} wallet(s) on {', '.join(self.chains[c].name for c in chain_ids)}. The plan follows in a moment."
 
-    def prepare_send(self, dest, accounts, chain_ids, extra, deep):
+    def prepare_send(self, dest, accounts, chain_ids, extra, deep, given=()):
         try:
             transfers, blocked, missing, skipped = [], [], [], []
             names = {}
@@ -1701,11 +1750,11 @@ class Bot:
                         skipped.append(acct.address)
                         continue
                     where = [c for c in extra if self.has_code(chain_id, c)]
-                    for group in self.find_nfts(chain_id, acct, where, deep):
+                    for group in self.find_nfts(chain_id, acct, where, deep, given):
                         name = self.collection_name(chain_id, group["collection"]) or short_address(group["collection"])
                         names[(chain_id, group["collection"])] = name
                         if group["missing"]:
-                            missing.append((chain_id, acct.address, group["collection"], group["missing"]))
+                            missing.append((chain_id, acct.address, group["collection"], group["missing"], group.get("note", "")))
                         for token_id, amount in group["items"]:
                             data = self.transfer_data(group["std"], acct.address, dest, token_id, amount)
                             transfer = {
@@ -1760,7 +1809,16 @@ class Bot:
             body += f"Cannot send {len(blocked)} NFT(s) (the contract refused the transfer): {blocked[0][1]}\n"
         if missing:
             more = sum(m[3] for m in missing)
-            body += f"{more} more NFT(s) are held but I cannot list their token IDs." + ("" if deep else " Add collection=0xabc… or deep to look harder.") + "\n"
+            body += f"{more} more NFT(s) are held but I cannot list their token IDs."
+            notes = []
+            for m in missing:
+                if m[4] and m[4] not in notes:
+                    notes.append(m[4])
+            if notes:
+                body += " Why: " + "; ".join(notes) + "."
+            elif not deep:
+                body += " Add collection=0xabc… and deep to look harder."
+            body += "\n"
         if skipped:
             body += "Skipped (already the destination): " + ", ".join(short_address(a) for a in skipped) + "\n"
         if self.dry:
