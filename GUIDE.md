@@ -127,6 +127,7 @@ Type `/` in the chat with your bot to see the menu.
 | `/balance` | Shows each minter's native balance on every chain |
 | `/cap` | Shows the mint cap per chain. `/cap 4663 0.1` sets one chain, `/cap all 0.05` sets all |
 | `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] [wallets=1,3]` | Mints a public-mint contract with every minter (or only the numbered ones in `wallets=`, as `/minters` lists them), without a watched wallet. Quantity defaults to 1. If you leave out the price, it is read from the contract |
+| `/sendnfts 0xDESTINATION [wallets=1,3]` | Sends every NFT your minters hold to the wallet you name. It shows a plan first; send `/sendnfts confirm` within 2 minutes to go ahead, or `/sendnfts cancel`. It knows the NFTs minted through the bot since this feature was added; add `collection=0xabc…` or `deep` for older ones |
 | `/help` | Lists the commands |
 
 Notes:
