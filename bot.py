@@ -34,6 +34,10 @@ TRANSFER_BATCH = "0x" + keccak(text="TransferBatch(address,address,address,uint2
 ZERO_TOPIC = "0x" + "0" * 64
 LIFI = "https://li.quest/v1/quote"
 MAX_ATTEMPTS = 3
+BLOCK_RETRIES = 30
+RETRY_GAP_SECONDS = 3
+LAND_SECONDS = 90
+REFETCH_SECONDS = 60
 # Blocks per eth_getLogs request. Alchemy's free plan rejects ranges above 10, so 10 is the safe default.
 # Raise LOGS_MAX_BLOCKS on a plan that allows larger ranges.
 try:
@@ -702,6 +706,8 @@ class Bot:
         self.minted_before = {}
         # chain:collection:wallet -> {"std": 721 or 1155, "ids": [token ids]} for NFTs the minters received.
         self.holdings = {}
+        self._block_fails = {}
+        self.refetch = {}
         self.send_plan = None
         self.send_cancel = threading.Event()
         # OpenSea purchases. Needs OPENSEA_API_KEY. MAX_BUY_ETH caps the price of any single purchase.
@@ -1659,7 +1665,7 @@ class Bot:
         """Everything this wallet holds on one chain: a list of dicts with collection, std, items and missing."""
         wallet = acct.address.lower()
         hints = {}
-        for key, entry in self.holdings.items():
+        for key, entry in list(self.holdings.items()):
             cid, collection, holder = key.split(":")
             if int(cid) == chain_id and holder == wallet:
                 hints[collection] = (entry["std"], entry["ids"])
@@ -1707,7 +1713,7 @@ class Bot:
             value = Decimal(str(text))
         except Exception:
             return None
-        if value <= 0 or value > 1000:
+        if not value.is_finite() or value <= 0 or value > 1000:
             return None
         return to_wei(value)
 
@@ -1729,11 +1735,15 @@ class Bot:
         word0 = args[0].lower()
         if word0 == "cancel":
             with self._buy_lock:
-                plan, self.buy_plan = self.buy_plan, None
-            if not plan:
-                return "Nothing is waiting to be bought."
-            self.buy_cancel.set()
-            return "🛑 Cancelled." if plan["state"] == "planned" else "🛑 Stopping. A purchase already sent cannot be undone."
+                plan = self.buy_plan
+                if not plan:
+                    return "Nothing is waiting to be bought."
+                if plan["state"] == "planned":
+                    self.buy_plan = None
+                    return "🛑 Cancelled."
+                plan["state"] = "stopping"
+                plan["cancel"].set()
+            return "🛑 Stopping. A purchase already sent cannot be undone."
         if word0 == "confirm":
             with self._buy_lock:
                 plan = self.buy_plan
@@ -1743,7 +1753,6 @@ class Bot:
                     self.buy_plan = None
                     return "⌛ That purchase expired. Send the /buy command again."
                 plan["state"] = "running"
-                self.buy_cancel.clear()
             threading.Thread(target=self.run_buy, args=(plan,), daemon=True).start()
             mode = " (dry run, nothing will be sent)" if self.dry else ""
             return f"✅ Buying{mode}. I will message you when it is done."
@@ -1751,8 +1760,8 @@ class Bot:
         if missing:
             return missing
         with self._buy_lock:
-            if self.buy_plan and self.buy_plan["state"] == "running":
-                return "A purchase is already running. Send /buy cancel to stop it."
+            if self.buy_plan and self.buy_plan["state"] in ("running", "stopping"):
+                return "A purchase is already running or stopping. Send /buy cancel to stop it."
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         max_spec = self.pull_option(args, ("max=", "limit="))
         accounts, error = self.choose_minters(wallet_spec)
@@ -1802,6 +1811,7 @@ class Bot:
             "listing": listing,
             "max": max_wei,
             "wallets": [a.address.lower() for a in accounts],
+            "cancel": threading.Event(),
         }
         with self._buy_lock:
             self.buy_plan = plan
@@ -1833,7 +1843,9 @@ class Bot:
         try:
             to, value, data, function = self.opensea.fulfilment(listing, slug, acct.address)
         except opensea.OpenSeaError as exc:
-            return "failed", str(exc), None
+            # A rate limit, outage or timeout can pass; a 4xx means OpenSea refused this listing.
+            passing = exc.status is None or exc.status == 429 or exc.status >= 500
+            return ("retry" if passing else "failed"), str(exc), None
         if to.lower() not in SEAPORT_ADDRESSES:
             return "failed", f"OpenSea pointed at an address I do not recognise as Seaport ({short_address(to)})", None
         if value <= 0:
@@ -1862,20 +1874,29 @@ class Bot:
         if self.dry:
             return "would", fmt_native(value, chain_id), None
         with self._copy_lock:
-            txh, ok, _sent = self.land(chain_id, acct, to, data, value, gas)
+            txh, ok, sent = self.land(chain_id, acct, to, data, value, gas)
         if not ok:
-            return "failed", "the transaction did not confirm (someone else may have bought it first)", txh
+            # No receipt in time does not mean it failed: it may land a moment later. Look once more before deciding.
+            try:
+                hit = self.receipt_for(chain_id, sent)
+            except Exception:
+                hit = None
+            if hit is None:
+                return "pending", f"sent but not confirmed yet, price {fmt_native(value, chain_id)}", txh
+            txh, ok = hit
+        if not ok:
+            return "failed", "the transaction reverted (someone else may have bought it first)", txh
         self.record_holdings_later(chain_id, acct.address, txh)
         return "bought", fmt_native(value, chain_id), txh
 
     def run_buy(self, plan):
         chain_id = plan["chain"]
-        lines, done = [], False
+        lines, done, waiting = [], False, False
         try:
             for acct in self.minters:
                 if acct.address.lower() not in plan["wallets"]:
                     continue
-                if self.buy_cancel.is_set():
+                if plan["cancel"].is_set():
                     lines.append("🛑 stopped")
                     break
                 number = self.minters.index(acct) + 1
@@ -1883,18 +1904,25 @@ class Bot:
                     status, detail, txh = self.buy_one(chain_id, acct, plan, plan["listing"])
                 except Exception as exc:
                     status, detail, txh = "failed", f"{type(exc).__name__}: {str(exc)[:120]}", None
-                icon = {"bought": "✅", "would": "🧪", "skipped": "⏭", "failed": "❌"}[status]
+                icon = {"bought": "✅", "would": "🧪", "pending": "⏳", "skipped": "⏭", "failed": "❌", "retry": "❌"}[status]
                 tail = f" · tx {code(txh)}" if txh else ""
                 label = {"bought": "bought for", "would": "would buy for"}.get(status, "")
                 lines.append(f"{icon} 👛 {number}. {code(short_address(acct.address))} {label} {esc(detail)}{tail}".replace("  ", " "))
+                if status == "pending":
+                    # It may still land, so never try another wallet and risk a second copy.
+                    waiting = True
+                    break
                 if status in ("bought", "would"):
                     done = True
                     break
-            title = "Bought" if done and not self.dry else ("Would buy (dry run)" if done else "Not bought")
+            if waiting:
+                title = "Sent, waiting for confirmation"
+            else:
+                title = "Bought" if done and not self.dry else ("Would buy (dry run)" if done else "Not bought")
             alert(
                 f"{title}: {plan['contract']} #{plan['token']}",
                 card(
-                    f"{'✅' if done else '❌'} {title} · {self.chains[chain_id].name}",
+                    f"{'✅' if done else ('⏳' if waiting else '❌')} {title} · {self.chains[chain_id].name}",
                     ("NFT", esc(f"{plan['name'] or 'token'} #{plan['token']}")),
                     ("CA", code(plan["contract"])),
                     ("Price", esc(fmt_native(plan["listing"]["price_wei"], chain_id))),
@@ -2018,6 +2046,7 @@ class Bot:
             "wallets": [a.address.lower() for a in accounts],
             "seen": set(),
             "later": {},
+            "retries": {},
             "bought": 0,
             "spent": 0,
             "tried": 0,
@@ -2096,7 +2125,34 @@ class Bot:
                         try:
                             status, detail, txh = self.buy_one(chain_id, acct, sub, row)
                         except Exception as exc:
-                            status, detail, txh = "failed", f"{type(exc).__name__}: {str(exc)[:120]}", None
+                            status, detail, txh = "retry", f"{type(exc).__name__}: {str(exc)[:120]}", None
+                        if status == "pending":
+                            # Sent but not confirmed. Count the spend so the budget holds, and never retry this listing.
+                            plan["seen"].add(row["hash"])
+                            plan["spent"] += row["price_wei"]
+                            plan["bought"] += 1
+                            turn = (turn + step + 1) % len(wallets)
+                            alert(
+                                f"Sweep sent, waiting for confirmation: {row['contract']} #{row['token_id']}",
+                                card(
+                                    f"⏳ Sweep sent, waiting for confirmation · {self.chains[chain_id].name}",
+                                    ("CA", code(row["contract"])),
+                                    ("Token", esc(f"#{row['token_id']}")),
+                                    ("Tx", code(txh)),
+                                ),
+                            )
+                            break
+                        if status == "retry":
+                            # A passing problem (rate limit, RPC hiccup). Look at this listing again soon, a few times at most.
+                            count = plan["retries"].get(row["hash"], 0) + 1
+                            plan["retries"][row["hash"]] = count
+                            plan["error"] = detail[:160]
+                            log(f"sweep retry {row['hash'][:12]} {detail}")
+                            if count >= 5:
+                                plan["seen"].add(row["hash"])
+                            else:
+                                plan["later"][row["hash"]] = time.time() + 30
+                            break
                         if status in ("bought", "would"):
                             plan["seen"].add(row["hash"])
                             turn = (turn + step + 1) % len(wallets)
@@ -2164,11 +2220,16 @@ class Bot:
         word0 = args[0].lower()
         if word0 == "cancel":
             with self._send_lock:
-                plan, self.send_plan = self.send_plan, None
-            if not plan:
-                return "Nothing is waiting to be sent."
-            self.send_cancel.set()
-            return "🛑 Cancelled." if plan["state"] == "planned" else "🛑 Stopping. Transfers already sent cannot be undone."
+                plan = self.send_plan
+                if not plan:
+                    return "Nothing is waiting to be sent."
+                if plan["state"] == "planned":
+                    self.send_plan = None
+                    return "🛑 Cancelled."
+                # A run is going. Stop that run only, and keep the plan in place until its thread ends.
+                plan["state"] = "stopping"
+                plan["cancel"].set()
+            return "🛑 Stopping. Transfers already sent cannot be undone."
         if word0 == "confirm":
             with self._send_lock:
                 plan = self.send_plan
@@ -2178,13 +2239,12 @@ class Bot:
                     self.send_plan = None
                     return "⌛ That plan expired. Send the /sendnfts command again."
                 plan["state"] = "running"
-                self.send_cancel.clear()
             threading.Thread(target=self.run_send, args=(plan,), daemon=True).start()
             mode = " (dry run, nothing will be sent)" if self.dry else ""
             return f"✅ Sending {len(plan['transfers'])} NFT transfer(s) to {plan['dest']}{mode}. A summary follows."
         with self._send_lock:
-            if self.send_plan and self.send_plan["state"] == "running":
-                return "A send is already running. Send /sendnfts cancel to stop it."
+            if self.send_plan and self.send_plan["state"] in ("running", "stopping"):
+                return "A send is already running or stopping. Send /sendnfts cancel to stop it."
         deep = False
         for token in list(args):
             if token.lower() == "deep":
@@ -2262,7 +2322,7 @@ class Bot:
                             except Exception as exc:
                                 reason = decode_revert("", str(exc)) or "the contract refused the transfer"
                                 blocked.append((transfer, reason))
-            plan = {"dest": dest, "transfers": transfers, "created": time.time(), "state": "planned", "blocked": len(blocked)}
+            plan = {"dest": dest, "transfers": transfers, "created": time.time(), "state": "planned", "blocked": len(blocked), "cancel": threading.Event()}
             text = self.send_plan_text(plan, names, blocked, missing, skipped, deep)
             with self._send_lock:
                 if transfers and not (self.send_plan and self.send_plan["state"] == "running"):
@@ -2316,7 +2376,7 @@ class Bot:
 
     def send_worker(self, plan, chain_id, acct, items, results):
         for t in items:
-            if self.send_cancel.is_set():
+            if self.send_cancel.is_set() or plan["cancel"].is_set():
                 results.append((t, "cancelled", "stopped before this one"))
                 continue
             data = self.transfer_data(t["std"], acct.address, plan["dest"], int(t["id"]), t["amount"])
@@ -2569,7 +2629,14 @@ class Bot:
                 "type": 2,
             }
         )
-        txh = self.rpc.call(chain_id, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+        try:
+            txh = self.rpc.call(chain_id, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # The node may have accepted it before the connection dropped. Keep the hash so it is watched, not re-sent blind.
+            txh = "0x" + signed.hash.hex()
+            log(f"broadcast unclear for {txh} ({type(exc).__name__}); watching for it")
+            if not wait:
+                return txh, False
         if not wait:
             return txh, False
         for _ in range(40):
@@ -2593,23 +2660,27 @@ class Bot:
         # replacement can land, so both have to be watched for a receipt.
         sent = [txh]
         bumped = False
-        deadline = time.time() + 90
+        deadline = time.time() + LAND_SECONDS
         while time.time() < deadline:
-            hit = self.receipt_for(chain_id, sent)
-            if hit:
-                return hit[0], hit[1], sent
-            now = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
-            if not bumped and now >= start + 2:
-                bumped = True
-                new_fee = max(int(fee * 2), fee + 1)
-                new_tip = min(max(int(tip * 2), tip + 1), new_fee)
-                try:
-                    new_hash, _ = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
-                    sent.append(new_hash)
-                    log(f"replaced {acct.address[:8]} {new_hash}")
-                except Exception as exc:
-                    if "nonce" not in str(exc).lower():
-                        log(f"replace {acct.address[:8]} {exc}")
+            try:
+                hit = self.receipt_for(chain_id, sent)
+                if hit:
+                    return hit[0], hit[1], sent
+                now = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+                if not bumped and now >= start + 2:
+                    bumped = True
+                    new_fee = max(int(fee * 2), fee + 1)
+                    new_tip = min(max(int(tip * 2), tip + 1), new_fee)
+                    try:
+                        new_hash, _ = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
+                        sent.append(new_hash)
+                        log(f"replaced {acct.address[:8]} {new_hash}")
+                    except Exception as exc:
+                        if "nonce" not in str(exc).lower():
+                            log(f"replace {acct.address[:8]} {exc}")
+            except Exception as exc:
+                # The transaction is already broadcast. Report it as pending with its hashes, never raise and lose them.
+                log(f"waiting on {sent[-1]} hit {type(exc).__name__}: {exc}")
             time.sleep(0.6)
         return sent[-1], False, sent
 
@@ -2761,7 +2832,8 @@ class Bot:
             topics = [t.lower() for t in entry.get("topics") or []]
             collection = entry.get("address", "").lower()
             qty = 0
-            if len(topics) >= 3 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
+            # ERC-721 indexes the token ID (4 topics). ERC-20 Transfer has 3, so stETH, LP tokens and the like are not mints.
+            if len(topics) == 4 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
                 if topic_address(topics[2]) in recipients:
                     qty = 1
             elif len(topics) >= 4 and topics[0] == TRANSFER_SINGLE and topics[2] == ZERO_TOPIC:
@@ -3258,7 +3330,12 @@ class Bot:
             self.send_summary(chain_id, tx, want, item, gave_up=True, note=f"gave up after {item['attempts']} attempts")
             self.seen.add(key)
             self.pending.pop(key, None)
+        elif self.paused:
+            # /off was sent while this copy ran. Paused mints are not replayed.
+            self.seen.add(key)
+            self.pending.pop(key, None)
         else:
+            item["next_try"] = time.time() + RETRY_GAP_SECONDS
             self.pending[key] = item
         self._save()
         return len(done)
@@ -3336,7 +3413,16 @@ class Bot:
             entries = self.logs_for(chain_id, start, end)
         except Exception as exc:
             if start == end:
-                log(f"{self.chains[chain_id].name} skip block {start} {exc}")
+                # A passing RPC error must not skip the block for good: stop here and retry on the next poll.
+                # Only a block that keeps failing is given up on.
+                key = (chain_id, start)
+                fails = self._block_fails.get(key, 0) + 1
+                if fails < BLOCK_RETRIES:
+                    self._block_fails[key] = fails
+                    log(f"{self.chains[chain_id].name} block {start} failed ({fails}/{BLOCK_RETRIES}), will retry: {exc}")
+                    return start - 1
+                self._block_fails.pop(key, None)
+                log(f"{self.chains[chain_id].name} skip block {start} after {fails} tries: {exc}")
                 return end
             mid = (start + end) // 2
             reached = self.take_range(chain_id, start, mid)
@@ -3361,12 +3447,20 @@ class Bot:
             # Checked inside the lock, so a mint seen by both paths is copied once.
             if key in self.seen:
                 return
+            tx = None
             try:
                 tx = self.rpc.call(chain_id, "eth_getTransactionByHash", [txh])
             except Exception as exc:
                 log(f"tx {txh} {exc}")
+            if not tx:
+                # A node that is a block behind returns nothing for a tx that was just mined. Try again shortly.
+                held = self.refetch.setdefault(key, {"chain": chain_id, "txh": txh, "logs": logs, "until": time.time() + REFETCH_SECONDS})
+                if time.time() > held["until"]:
+                    self.refetch.pop(key, None)
+                    alert(f"⚠️ could not read mint tx {txh} on {self.chains[chain_id].name}; it was not copied")
                 return
-            if not tx or not tx.get("to"):
+            self.refetch.pop(key, None)
+            if not tx.get("to"):
                 return
             sender = (tx.get("from") or "").lower()
             if sender not in self.watch or sender in self.own:
@@ -3400,7 +3494,13 @@ class Bot:
             try:
                 finished = self.copy(chain_id, tx, want)
             except Exception as exc:
-                log(f"tx {txh} {exc}")
+                # Some wallets may already have minted, so do not copy this again. Better to miss one than to double-mint.
+                log(f"tx {txh} {type(exc).__name__}: {exc}")
+                self.seen.add(key)
+                self.pending.pop(key, None)
+                self.release_collection_cooldown(chain_id, txh, want)
+                self._save()
+                alert(f"⚠️ copying {txh} on {self.chains[chain_id].name} hit an error ({type(exc).__name__}). Check your minters before retrying by hand.")
                 return
             if not finished and key not in self.pending:
                 # Nothing was minted and nothing is retrying, so do not hold the collection for nobody.
@@ -3589,9 +3689,18 @@ class Bot:
             cursor = reached + 1
 
     def retry_pending(self):
+        for key, held in list(self.refetch.items()):
+            if time.time() >= held.get("next", 0):
+                held["next"] = time.time() + 1
+                try:
+                    self.handle_tx(held["chain"], held["txh"], held["logs"])
+                except Exception as exc:
+                    log(f"refetch {held['txh']} {exc}")
         if self.paused:
             return
         for key, item in list(self.pending.items()):
+            if time.time() < float(item.get("next_try") or 0):
+                continue
             chain_id = int(item["chain"])
             if chain_id not in self.chains:
                 continue

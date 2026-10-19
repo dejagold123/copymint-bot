@@ -333,7 +333,9 @@ class OpenSea:
                     "limit": 1,
                 },
             )
-            return normalise_listing(data)
+            found = normalise_listing(data)
+            if found:
+                return found
         except OpenSeaError as exc:
             errors.append(exc)
         real = [e for e in errors if e.status not in (404,)]

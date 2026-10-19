@@ -273,10 +273,40 @@ class BuyCommandTests(unittest.TestCase):
         first = b.minters[0].address
         second = b.minters[1].address
         sims = [([transfer_log(NFT, first, 7)], 200_000), ([transfer_log(NFT, second, 7)], 200_000)]
-        sent, landed, record = self.run_plan(b, sims, land=("0xtx", False, ["0xtx"]))
+        with mock.patch.object(b, "receipt_for", return_value=("0xtx", False)):
+            sent, landed, record = self.run_plan(b, sims, land=("0xtx", False, ["0xtx"]))
         self.assertEqual(landed.call_count, 2)
         record.assert_not_called()
         self.assertTrue(sent[0][0].startswith("Not bought"))
+
+    def test_slow_confirmation_is_pending_and_stops_other_wallets(self):
+        b = make_bot()
+        first = b.minters[0].address
+        sims = [([transfer_log(NFT, first, 7)], 200_000)] * 2
+        with mock.patch.object(b, "receipt_for", return_value=None):
+            sent, landed, record = self.run_plan(b, sims, land=("0xtx", False, ["0xtx"]))
+        self.assertEqual(landed.call_count, 1)
+        self.assertTrue(sent[0][0].startswith("Sent, waiting"))
+
+    def test_late_receipt_counts_as_bought(self):
+        b = make_bot()
+        first = b.minters[0].address
+        with mock.patch.object(b, "receipt_for", return_value=("0xtx", True)):
+            sent, landed, record = self.run_plan(b, [([transfer_log(NFT, first, 7)], 200_000)], land=("0xtx", False, ["0xtx"]))
+        record.assert_called_once()
+        self.assertTrue(sent[0][0].startswith("Bought"))
+
+    def test_cancel_keeps_plan_until_run_ends_and_blocks_a_new_buy(self):
+        b = make_bot()
+        b.opensea = FakeOpenSea()
+        with mock.patch.object(b, "balance", return_value=ETH):
+            b.buy_command([LINK])
+        plan = b.buy_plan
+        plan["state"] = "running"
+        self.assertIn("Stopping", b.buy_command(["cancel"]))
+        self.assertTrue(plan["cancel"].is_set())
+        self.assertIs(b.buy_plan, plan)
+        self.assertIn("already running or stopping", b.buy_command([LINK]))
 
 
 if __name__ == "__main__":
