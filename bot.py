@@ -26,6 +26,8 @@ from pathlib import Path
 from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 
+import opensea
+
 TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
 TRANSFER_SINGLE = "0x" + keccak(text="TransferSingle(address,address,address,uint256,uint256)").hex()
 TRANSFER_BATCH = "0x" + keccak(text="TransferBatch(address,address,address,uint256[],uint256[])").hex()
@@ -86,6 +88,7 @@ TOTAL_SUPPLY = selector("totalSupply()")
 SAFE_TRANSFER_721 = selector("safeTransferFrom(address,address,uint256)")
 SAFE_TRANSFER_1155 = selector("safeTransferFrom(address,address,uint256,uint256,bytes)")
 SEND_PLAN_SECONDS = 120
+SEAPORT_ADDRESSES = {"0x0000000000000068f116a894984e2db1123eb395", "0x00000000000000adc04c56bf30ac9d3c0aaf14dc"}
 DEEP_SCAN_LIMIT = 5000
 MAX_HOLDINGS = 5000
 
@@ -292,6 +295,8 @@ MENU = (
     ("mint", "🎟 Mint a contract with all minters"),
     ("snipe", "🎯 Schedule a timed mint"),
     ("sendnfts", "📦 Send all NFTs to one wallet"),
+    ("buy", "🛒 Buy an NFT from an OpenSea link"),
+    ("sweep", "🧹 Buy listings below a price"),
     ("help", "ℹ️ List every command"),
 )
 
@@ -531,6 +536,22 @@ def topic_address(topic):
     return "0x" + topic[-40:]
 
 
+def nft_received(logs, contract, buyer, token_id):
+    """True when the logs show the buyer receiving that token from that contract (ERC-721 or ERC-1155)."""
+    buyer = buyer.lower()
+    for entry in logs or []:
+        if (entry.get("address") or "").lower() != contract.lower():
+            continue
+        topics = [str(t).lower() for t in entry.get("topics") or []]
+        data = entry.get("data") or "0x"
+        if len(topics) == 4 and topics[0] == TRANSFER and topic_address(topics[2]) == buyer and int(topics[3], 16) == token_id:
+            return True
+        if len(topics) == 4 and topics[0] == TRANSFER_SINGLE and topic_address(topics[3]) == buyer and len(data) >= 2 + 128:
+            if int(data[2:66], 16) == token_id:
+                return True
+    return False
+
+
 def collect_logs(node, found):
     if isinstance(node, dict):
         topics = node.get("topics")
@@ -683,6 +704,17 @@ class Bot:
         self.holdings = {}
         self.send_plan = None
         self.send_cancel = threading.Event()
+        # OpenSea purchases. Needs OPENSEA_API_KEY. MAX_BUY_ETH caps the price of any single purchase.
+        key = env("OPENSEA_API_KEY")
+        self.opensea = opensea.OpenSea(key) if key else None
+        self.max_buy = to_wei(env("MAX_BUY_ETH", "0.05"))
+        self.buy_plan = None
+        self.buy_cancel = threading.Event()
+        self._buy_lock = threading.Lock()
+        self.sweep_plan = None
+        self.sweep_stop = threading.Event()
+        self._sweep_lock = threading.Lock()
+        self.sweep_poll = max(2.0, float(env("SWEEP_POLL_SECONDS", "5")))
         self._send_lock = threading.Lock()
         self._names = {}
         self._collection_lock = threading.Lock()
@@ -1661,6 +1693,462 @@ class Bot:
         body = encode(["address", "address", "uint256", "uint256", "bytes"], [to_checksum_address(sender), to_checksum_address(dest), token_id, amount, b""])
         return SAFE_TRANSFER_1155 + body.hex()
 
+    def opensea_missing(self):
+        if self.opensea:
+            return None
+        return (
+            "🔑 OpenSea is not set up. Add OPENSEA_API_KEY in your Railway variables "
+            "(get a key from your OpenSea developer settings), redeploy, then try again."
+        )
+
+    def read_amount(self, text):
+        """A positive coin amount such as 0.01 as wei, or None."""
+        try:
+            value = Decimal(str(text))
+        except Exception:
+            return None
+        if value <= 0 or value > 1000:
+            return None
+        return to_wei(value)
+
+    def buy_command(self, args):
+        args = list(args)
+        usage = (
+            "✏️ Usage: /buy OPENSEA_ITEM_LINK [wallets=1,3] [max=0.01]\n"
+            "Buys that one NFT at its current lowest listing price, in the chain's own coin.\n"
+            "wallets=1,3 picks the buyers (numbers as /minters lists them). With several wallets, I try them in order and stop at the first that buys.\n"
+            f"max= sets the highest price I will pay. It can only go below the limit of {fmt_native(self.max_buy, 4663)} (MAX_BUY_ETH in Railway).\n"
+            "I show you the price first. Then /buy confirm within 2 minutes, or /buy cancel.\n"
+            "Every purchase is simulated before it is sent, and skipped if it would not give the wallet the NFT."
+        )
+        if not args:
+            plan = self.buy_plan
+            if plan:
+                return f"State: {plan['state']}\n" + self.buy_plan_text(plan)
+            return usage
+        word0 = args[0].lower()
+        if word0 == "cancel":
+            with self._buy_lock:
+                plan, self.buy_plan = self.buy_plan, None
+            if not plan:
+                return "Nothing is waiting to be bought."
+            self.buy_cancel.set()
+            return "🛑 Cancelled." if plan["state"] == "planned" else "🛑 Stopping. A purchase already sent cannot be undone."
+        if word0 == "confirm":
+            with self._buy_lock:
+                plan = self.buy_plan
+                if not plan or plan["state"] != "planned":
+                    return "There is no purchase waiting for confirmation. Create one with /buy first."
+                if time.time() - plan["created"] > SEND_PLAN_SECONDS:
+                    self.buy_plan = None
+                    return "⌛ That purchase expired. Send the /buy command again."
+                plan["state"] = "running"
+                self.buy_cancel.clear()
+            threading.Thread(target=self.run_buy, args=(plan,), daemon=True).start()
+            mode = " (dry run, nothing will be sent)" if self.dry else ""
+            return f"✅ Buying{mode}. I will message you when it is done."
+        missing = self.opensea_missing()
+        if missing:
+            return missing
+        with self._buy_lock:
+            if self.buy_plan and self.buy_plan["state"] == "running":
+                return "A purchase is already running. Send /buy cancel to stop it."
+        wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
+        max_spec = self.pull_option(args, ("max=", "limit="))
+        accounts, error = self.choose_minters(wallet_spec)
+        if error:
+            return error
+        max_wei = self.max_buy
+        if max_spec is not None:
+            wanted = self.read_amount(max_spec)
+            if wanted is None:
+                return f"⚠️ I could not read max={max_spec} as an amount. Use something like max=0.01."
+            if wanted > self.max_buy:
+                return f"⚠️ max={max_spec} is above your limit of {fmt_native(self.max_buy, 4663)}. Raise MAX_BUY_ETH in Railway to allow it."
+            max_wei = wanted
+        parsed = opensea.parse_item_link(" ".join(args))
+        if not parsed:
+            return "⚠️ I need an OpenSea item link like opensea.io/item/robinhood/0xCONTRACT/123.\n\n" + usage
+        slug, contract, token_id = parsed
+        chain_id = opensea.SLUG_TO_CHAIN.get(slug)
+        if chain_id is None or chain_id not in self.chains:
+            enabled = ", ".join(opensea.CHAIN_TO_SLUG.get(c, str(c)) for c in self.chains)
+            return f"⚠️ That link is on \"{slug}\", which this bot is not running. Enabled: {enabled}."
+        try:
+            collection, name = self.opensea.collection_slug(slug, contract, token_id)
+            listing = self.opensea.best_listing(slug, collection, contract, token_id)
+        except opensea.OpenSeaError as exc:
+            return f"⚠️ OpenSea said no: {exc}"
+        if not listing:
+            return "📭 That NFT has no active listing on OpenSea right now, so there is nothing to buy."
+        if listing["native"] is False:
+            return "⚠️ That listing is priced in a token, not the chain's own coin. I only buy native-coin listings for now."
+        if listing["quantity"] > 1:
+            return "⚠️ That listing sells more than one copy. I only buy single-item listings for now."
+        if listing["price_wei"] > max_wei:
+            return (
+                f"💸 It is listed at {fmt_native(listing['price_wei'], chain_id)}, above your limit of {fmt_native(max_wei, chain_id)}. "
+                "Add a higher max= (up to MAX_BUY_ETH) if you want it."
+            )
+        plan = {
+            "state": "planned",
+            "created": time.time(),
+            "chain": chain_id,
+            "slug": slug,
+            "contract": contract,
+            "token": token_id,
+            "name": name or "",
+            "collection": collection or "",
+            "listing": listing,
+            "max": max_wei,
+            "wallets": [a.address.lower() for a in accounts],
+        }
+        with self._buy_lock:
+            self.buy_plan = plan
+        return self.buy_plan_text(plan) + "\n\nSend /buy confirm within 2 minutes to buy, or /buy cancel."
+
+    def buy_plan_text(self, plan):
+        chain_id = plan["chain"]
+        lines = [
+            f"🛒 Buy on {self.chains[chain_id].name}",
+            f"NFT: {plan['name'] or 'token ' + str(plan['token'])} (#{plan['token']})",
+            f"CA: {plan['contract']}",
+            f"Price: {fmt_native(plan['listing']['price_wei'], chain_id)}   (highest I will pay: {fmt_native(plan['max'], chain_id)})",
+            "Buyers, in order:",
+        ]
+        for number, acct in enumerate(self.minters, 1):
+            if acct.address.lower() in plan["wallets"]:
+                try:
+                    have = fmt_native(self.balance(chain_id, "native", acct.address), chain_id)
+                except Exception:
+                    have = "balance unavailable"
+                lines.append(f"  👛 {number}. {short_address(acct.address)} has {have}")
+        if self.dry:
+            lines.append("🧪 Dry run is on: nothing will be sent.")
+        return "\n".join(lines)
+
+    def buy_one(self, chain_id, acct, plan, listing):
+        """Try to buy the listing with one wallet. Returns (status, detail, txh). Status: bought, would, skipped or failed."""
+        slug, contract, token_id = plan["slug"], plan["contract"], plan["token"]
+        try:
+            to, value, data, function = self.opensea.fulfilment(listing, slug, acct.address)
+        except opensea.OpenSeaError as exc:
+            return "failed", str(exc), None
+        if to.lower() not in SEAPORT_ADDRESSES:
+            return "failed", f"OpenSea pointed at an address I do not recognise as Seaport ({short_address(to)})", None
+        if value <= 0:
+            return "failed", "this listing is not paid in the chain's own coin", None
+        if value > plan["max"]:
+            return "skipped", f"price is now {fmt_native(value, chain_id)}, above your limit of {fmt_native(plan['max'], chain_id)}", None
+        if value > listing["price_wei"] * 105 // 100:
+            return "skipped", f"price moved to {fmt_native(value, chain_id)} from {fmt_native(listing['price_wei'], chain_id)}", None
+        have = self.balance(chain_id, "native", acct.address)
+        if have < value:
+            return "skipped", f"has {fmt_native(have, chain_id)}, needs {fmt_native(value, chain_id)} plus gas", None
+        sim = self.simulate(chain_id, acct, to, data, value)
+        if sim is None:
+            info = self._revert or {}
+            reason = decode_revert(info.get("data"), info.get("message"))
+            return "failed", "the purchase would fail: " + (classify_reason(reason) if reason else "it reverted (the listing may be sold, cancelled or expired)"), None
+        if sim == "unsupported":
+            return "failed", "your RPC cannot simulate, and I will not send a purchase I cannot check", None
+        logs, gas_used = sim
+        if not nft_received(logs, contract, acct.address, token_id):
+            return "failed", "the simulation did not give this wallet the NFT, so I did not send", None
+        gas = int(gas_used * 1.3) + 30_000
+        fee, _tip = self.fees(chain_id)
+        if have < value + gas * fee:
+            return "skipped", f"has {fmt_native(have, chain_id)}, needs about {fmt_native(value + gas * fee, chain_id)} with gas", None
+        if self.dry:
+            return "would", fmt_native(value, chain_id), None
+        with self._copy_lock:
+            txh, ok, _sent = self.land(chain_id, acct, to, data, value, gas)
+        if not ok:
+            return "failed", "the transaction did not confirm (someone else may have bought it first)", txh
+        self.record_holdings_later(chain_id, acct.address, txh)
+        return "bought", fmt_native(value, chain_id), txh
+
+    def run_buy(self, plan):
+        chain_id = plan["chain"]
+        lines, done = [], False
+        try:
+            for acct in self.minters:
+                if acct.address.lower() not in plan["wallets"]:
+                    continue
+                if self.buy_cancel.is_set():
+                    lines.append("🛑 stopped")
+                    break
+                number = self.minters.index(acct) + 1
+                try:
+                    status, detail, txh = self.buy_one(chain_id, acct, plan, plan["listing"])
+                except Exception as exc:
+                    status, detail, txh = "failed", f"{type(exc).__name__}: {str(exc)[:120]}", None
+                icon = {"bought": "✅", "would": "🧪", "skipped": "⏭", "failed": "❌"}[status]
+                tail = f" · tx {code(txh)}" if txh else ""
+                label = {"bought": "bought for", "would": "would buy for"}.get(status, "")
+                lines.append(f"{icon} 👛 {number}. {code(short_address(acct.address))} {label} {esc(detail)}{tail}".replace("  ", " "))
+                if status in ("bought", "would"):
+                    done = True
+                    break
+            title = "Bought" if done and not self.dry else ("Would buy (dry run)" if done else "Not bought")
+            alert(
+                f"{title}: {plan['contract']} #{plan['token']}",
+                card(
+                    f"{'✅' if done else '❌'} {title} · {self.chains[chain_id].name}",
+                    ("NFT", esc(f"{plan['name'] or 'token'} #{plan['token']}")),
+                    ("CA", code(plan["contract"])),
+                    ("Price", esc(fmt_native(plan["listing"]["price_wei"], chain_id))),
+                ) + "\n" + "\n".join(lines),
+            )
+        finally:
+            with self._buy_lock:
+                if self.buy_plan is plan:
+                    self.buy_plan = None
+
+    def sweep_command(self, args):
+        args = list(args)
+        usage = (
+            "✏️ Usage: /sweep OPENSEA_COLLECTION_LINK max=0.002 [budget=0.5] [wallets=1,3] [chain=robinhood]\n"
+            "Watches that collection and buys every listing at or below max= (a price per NFT, in the chain's coin), cheapest first, until you stop it.\n"
+            "budget= is the most I may spend in total. When the next buy would pass it, I stop. Without it I run until /sweep stop.\n"
+            "wallets=1,3 picks the buyers (numbers as /minters lists them). I rotate through them and skip a wallet that cannot pay.\n"
+            "An item link also works instead of a collection link (then the chain comes from the link).\n"
+            f"max= can only go up to your limit of {fmt_native(self.max_buy, 4663)} (MAX_BUY_ETH in Railway).\n"
+            "Then /sweep confirm to start, /sweep stop to end, and /sweep alone shows progress.\n"
+            "A restart of the bot ends a sweep. It never resumes by itself."
+        )
+        if not args:
+            plan = self.sweep_plan
+            if plan:
+                return f"State: {plan['state']}\n" + self.sweep_plan_text(plan)
+            return usage
+        word0 = args[0].lower()
+        if word0 in ("stop", "cancel"):
+            with self._sweep_lock:
+                plan = self.sweep_plan
+                if not plan:
+                    return "No sweep is set up."
+                if plan["state"] == "planned":
+                    self.sweep_plan = None
+                    return "🛑 Cancelled."
+            self.sweep_stop.set()
+            return "🛑 Stopping the sweep. A purchase already sent cannot be undone. A summary follows."
+        if word0 == "confirm":
+            with self._sweep_lock:
+                plan = self.sweep_plan
+                if not plan or plan["state"] != "planned":
+                    return "There is no sweep waiting for confirmation. Create one with /sweep first."
+                if time.time() - plan["created"] > SEND_PLAN_SECONDS:
+                    self.sweep_plan = None
+                    return "⌛ That sweep expired. Send the /sweep command again."
+                plan["state"] = "running"
+                self.sweep_stop.clear()
+            threading.Thread(target=self.run_sweep, args=(plan,), daemon=True).start()
+            mode = " (dry run, nothing will be sent)" if self.dry else ""
+            return f"✅ Sweep started{mode}. I message you for each NFT bought and when it ends. /sweep stop ends it."
+        missing = self.opensea_missing()
+        if missing:
+            return missing
+        with self._sweep_lock:
+            if self.sweep_plan and self.sweep_plan["state"] == "running":
+                return "A sweep is already running. Send /sweep stop first."
+        wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
+        chain_word = self.pull_option(args, ("chain=", "c="))
+        max_spec = self.pull_option(args, ("max=", "price=", "limit="))
+        budget_spec = self.pull_option(args, ("budget=", "total="))
+        accounts, error = self.choose_minters(wallet_spec)
+        if error:
+            return error
+        if max_spec is None:
+            return "⚠️ I need max= (the highest price per NFT).\n\n" + usage
+        max_wei = self.read_amount(max_spec)
+        if max_wei is None:
+            return f"⚠️ I could not read max={max_spec} as an amount. Use something like max=0.002."
+        if max_wei > self.max_buy:
+            return f"⚠️ max={max_spec} is above your limit of {fmt_native(self.max_buy, 4663)}. Raise MAX_BUY_ETH in Railway to allow it."
+        budget = None
+        if budget_spec is not None:
+            budget = self.read_amount(budget_spec)
+            if budget is None:
+                return f"⚠️ I could not read budget={budget_spec} as an amount. Use something like budget=0.5."
+            if budget < max_wei:
+                return "⚠️ budget= is below max=, so I could not buy even one."
+        text = " ".join(args)
+        slug_chain, item_contract, item_token = (None, None, None)
+        item = opensea.parse_item_link(text)
+        chain_id = None
+        try:
+            if item:
+                slug_chain, item_contract, item_token = item
+                chain_id = opensea.SLUG_TO_CHAIN.get(slug_chain)
+                collection, _name = self.opensea.collection_slug(slug_chain, item_contract, item_token)
+            else:
+                collection = opensea.parse_collection_link(text)
+        except opensea.OpenSeaError as exc:
+            return f"⚠️ OpenSea said no: {exc}"
+        if not collection:
+            return "⚠️ I need an OpenSea collection link like opensea.io/collection/robo-cards.\n\n" + usage
+        if chain_word is not None:
+            chain_id = self.chain_from_word(chain_word)
+            if chain_id is None:
+                names = ", ".join(f"{c.name} ({cid})" for cid, c in self.chains.items())
+                return f"⚠️ I do not know the chain \"{chain_word}\". Enabled chains: {names}."
+        if chain_id is None:
+            if len(self.chains) == 1:
+                chain_id = next(iter(self.chains))
+            elif 4663 in self.chains:
+                chain_id = 4663
+            else:
+                return "⚠️ Add chain=robinhood (or another enabled chain), since a collection link does not say which chain."
+        if chain_id not in self.chains or chain_id not in opensea.CHAIN_TO_SLUG:
+            return f"⚠️ This bot is not running chain {chain_id} for OpenSea."
+        try:
+            rows = self.opensea.collection_listings(collection, limit=50)
+        except opensea.OpenSeaError as exc:
+            return f"⚠️ OpenSea said no: {exc}"
+        affordable = [r for r in rows if r["native"] is not False and r["quantity"] == 1 and r["price_wei"] <= max_wei]
+        plan = {
+            "state": "planned",
+            "created": time.time(),
+            "chain": chain_id,
+            "slug": opensea.CHAIN_TO_SLUG[chain_id],
+            "collection": collection,
+            "max": max_wei,
+            "budget": budget,
+            "wallets": [a.address.lower() for a in accounts],
+            "seen": set(),
+            "later": {},
+            "bought": 0,
+            "spent": 0,
+            "tried": 0,
+            "error": "",
+            "started": None,
+        }
+        with self._sweep_lock:
+            self.sweep_plan = plan
+        now = f"Right now {len(affordable)} of the {len(rows)} cheapest listings are at or below your price." if rows else "I see no listings right now."
+        return self.sweep_plan_text(plan) + f"\n{now}\n\nSend /sweep confirm within 2 minutes to start, or /sweep stop."
+
+    def sweep_plan_text(self, plan):
+        chain_id = plan["chain"]
+        budget = fmt_native(plan["budget"], chain_id) if plan["budget"] else "none (runs until /sweep stop)"
+        lines = [
+            f"🧹 Sweep on {self.chains[chain_id].name}",
+            f"Collection: {plan['collection']}",
+            f"Buys at or below: {fmt_native(plan['max'], chain_id)} each",
+            f"Total budget: {budget}",
+            f"Bought so far: {plan['bought']} for {fmt_native(plan['spent'], chain_id)} ({plan['tried']} attempts)",
+            "Buyers:",
+        ]
+        for number, acct in enumerate(self.minters, 1):
+            if acct.address.lower() in plan["wallets"]:
+                try:
+                    have = fmt_native(self.balance(chain_id, "native", acct.address), chain_id)
+                except Exception:
+                    have = "balance unavailable"
+                lines.append(f"  👛 {number}. {short_address(acct.address)} has {have}")
+        if plan["error"]:
+            lines.append(f"Last problem: {plan['error']}")
+        if self.dry:
+            lines.append("🧪 Dry run is on: nothing will be sent.")
+        return "\n".join(lines)
+
+    def run_sweep(self, plan):
+        chain_id = plan["chain"]
+        plan["started"] = time.time()
+        wallets = [a for a in self.minters if a.address.lower() in plan["wallets"]]
+        turn = 0
+        failures = 0
+        reason = "stopped by you"
+        try:
+            while not self.sweep_stop.is_set():
+                try:
+                    rows = self.opensea.collection_listings(plan["collection"], limit=50)
+                    failures = 0
+                    plan["error"] = ""
+                except opensea.OpenSeaError as exc:
+                    failures += 1
+                    plan["error"] = str(exc)[:160]
+                    log(f"sweep listings {exc}")
+                    if failures >= 20:
+                        reason = f"OpenSea kept failing: {plan['error']}"
+                        break
+                    self.sweep_stop.wait(30 if exc.status == 429 else self.sweep_poll * 2)
+                    continue
+                rows = sorted(rows, key=lambda r: r["price_wei"])
+                for row in rows:
+                    if self.sweep_stop.is_set():
+                        break
+                    if row["hash"] in plan["seen"] or plan["later"].get(row["hash"], 0) > time.time():
+                        continue
+                    if row["native"] is False or row["quantity"] != 1 or row["price_wei"] > plan["max"]:
+                        continue
+                    if not row.get("token_id") and row.get("token_id") != 0:
+                        continue
+                    if plan["budget"] and plan["spent"] + row["price_wei"] > plan["budget"]:
+                        reason = "budget reached"
+                        self.sweep_stop.set()
+                        break
+                    sub = {"slug": plan["slug"], "contract": row["contract"], "token": row["token_id"], "max": plan["max"]}
+                    for step in range(len(wallets)):
+                        acct = wallets[(turn + step) % len(wallets)]
+                        plan["tried"] += 1
+                        try:
+                            status, detail, txh = self.buy_one(chain_id, acct, sub, row)
+                        except Exception as exc:
+                            status, detail, txh = "failed", f"{type(exc).__name__}: {str(exc)[:120]}", None
+                        if status in ("bought", "would"):
+                            plan["seen"].add(row["hash"])
+                            turn = (turn + step + 1) % len(wallets)
+                            if status == "bought":
+                                plan["bought"] += 1
+                                plan["spent"] += row["price_wei"]
+                            else:
+                                plan["bought"] += 1
+                            number = self.minters.index(acct) + 1
+                            title = "Sweep bought" if status == "bought" else "Sweep would buy (dry run)"
+                            alert(
+                                f"{title}: {row['contract']} #{row['token_id']} for {detail}",
+                                card(
+                                    f"{'✅' if status == 'bought' else '🧪'} {title} · {self.chains[chain_id].name}",
+                                    ("Collection", esc(plan["collection"])),
+                                    ("CA", code(row["contract"])),
+                                    ("Token", esc(f"#{row['token_id']}")),
+                                    ("Price", esc(detail)),
+                                    ("Wallet", f"👛 {number}. {code(short_address(acct.address))}"),
+                                    ("Tx", code(txh) if txh else ""),
+                                    ("Total", esc(f"{plan['bought']} bought for {fmt_native(plan['spent'], chain_id)}")),
+                                ),
+                            )
+                            break
+                        if status == "failed":
+                            plan["seen"].add(row["hash"])
+                            plan["error"] = detail[:160]
+                            log(f"sweep skip {row['hash'][:12]} {detail}")
+                            break
+                        plan["error"] = detail[:160]
+                    else:
+                        # Every wallet was skipped (funds or price). Look at it again in a minute rather than every poll.
+                        plan["later"][row["hash"]] = time.time() + 60
+                self.sweep_stop.wait(self.sweep_poll)
+        except Exception as exc:
+            reason = f"error: {type(exc).__name__}: {str(exc)[:120]}"
+            log(f"sweep crashed {exc}")
+        finally:
+            alert(
+                f"Sweep ended: {reason}",
+                card(
+                    f"🧹 Sweep ended · {self.chains[chain_id].name}",
+                    ("Collection", esc(plan["collection"])),
+                    ("Why", esc(reason)),
+                    ("Bought", esc(f"{plan['bought']} for {fmt_native(plan['spent'], chain_id)}")),
+                    ("Last problem", esc(plan["error"])),
+                ),
+            )
+            with self._sweep_lock:
+                if self.sweep_plan is plan:
+                    self.sweep_plan = None
+
     def sendnfts_command(self, args):
         args = list(args)
         usage = (
@@ -1968,6 +2456,10 @@ class Bot:
             return self.snipe_command(args)
         if command == "/sendnfts":
             return self.sendnfts_command(args)
+        if command == "/buy":
+            return self.buy_command(args)
+        if command == "/sweep":
+            return self.sweep_command(args)
         if command in ("/help", "/start"):
             lines = ["Tap / to open the menu.\n"]
             lines.extend(f"/{name}  {text}" for name, text in MENU)
