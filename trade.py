@@ -204,6 +204,7 @@ class TradeMixin:
         if not ok:
             return "failed", "the transaction reverted (someone else may have bought it first)", txh
         self.record_holdings_later(chain_id, acct.address, txh)
+        self.record_buy(chain_id, acct.address, contract, token_id, value, txh)
         return "bought", fmt_native(value, chain_id), txh
 
     def run_buy(self, plan):
@@ -258,6 +259,7 @@ class TradeMixin:
             "budget= is the most I may spend in total. When the next buy would pass it, I stop. Without it I run until /sweep stop.\n"
             "wallets=1,3 picks the buyers (numbers as /minters lists them). I rotate through them and skip a wallet that cannot pay.\n"
             "An item link also works instead of a collection link (then the chain comes from the link).\n"
+            "Add trait=Background:Blue (repeat for more) to buy only NFTs with those traits, and rank=500 for rarity rank 500 or better.\n"
             f"max= can only go up to your limit of {fmt_native(self.max_buy, 4663)} (MAX_BUY_ETH in Railway).\n"
             "Then /sweep confirm to start, /sweep stop to end, and /sweep alone shows progress.\n"
             "A restart of the bot ends a sweep. It never resumes by itself."
@@ -277,6 +279,8 @@ class TradeMixin:
                     self.sweep_plan = None
                     return "🛑 Cancelled."
             self.sweep_stop.set()
+            if self.stream:
+                self.stream.changed.set()
             return "🛑 Stopping the sweep. A purchase already sent cannot be undone. A summary follows."
         if word0 == "confirm":
             with self._sweep_lock:
@@ -288,6 +292,8 @@ class TradeMixin:
                     return "⌛ That sweep expired. Send the /sweep command again."
                 plan["state"] = "running"
                 self.sweep_stop.clear()
+            if self.stream and self.setting("stream"):
+                self.stream.watch({plan["collection"]})
             threading.Thread(target=self.run_sweep, args=(plan,), daemon=True).start()
             mode = " (dry run, nothing will be sent)" if self.dry else ""
             return f"✅ Sweep started{mode}. I message you for each NFT bought and when it ends. /sweep stop ends it."
@@ -300,12 +306,28 @@ class TradeMixin:
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         chain_word = self.pull_option(args, ("chain=", "c="))
         max_spec = self.pull_option(args, ("max=", "price=", "limit="))
+        trait_specs = self.pull_all(args, ("trait=", "traits="))
+        rank_spec = self.pull_option(args, ("rank=",))
         budget_spec = self.pull_option(args, ("budget=", "total="))
         accounts, error = self.choose_minters(wallet_spec)
         if error:
             return error
         if max_spec is None:
             return "⚠️ I need max= (the highest price per NFT).\n\n" + usage
+        traits = {}
+        for spec in trait_specs:
+            for part in re.split(r"[;|]", spec):
+                if not part.strip():
+                    continue
+                if ":" not in part:
+                    return f"⚠️ I could not read trait={part}. Use trait=Background:Blue (underscores stand for spaces)."
+                name, value = part.split(":", 1)
+                traits[name.strip().replace("_", " ").lower()] = value.strip().replace("_", " ").lower()
+        rank = None
+        if rank_spec is not None:
+            if not rank_spec.isdigit() or int(rank_spec) < 1:
+                return "⚠️ rank= must be a whole number like rank=500 (best rank is 1)."
+            rank = int(rank_spec)
         max_wei = self.read_amount(max_spec)
         if max_wei is None:
             return f"⚠️ I could not read max={max_spec} as an amount. Use something like max=0.002."
@@ -360,6 +382,9 @@ class TradeMixin:
             "collection": collection,
             "max": max_wei,
             "budget": budget,
+            "traits": traits,
+            "rank": rank,
+            "details": {},
             "wallets": [a.address.lower() for a in accounts],
             "seen": set(),
             "later": {},
@@ -383,6 +408,8 @@ class TradeMixin:
             f"Collection: {plan['collection']}",
             f"Buys at or below: {fmt_native(plan['max'], chain_id)} each",
             f"Total budget: {budget}",
+            *([f"Only with: {', '.join(f'{k} = {v}' for k, v in plan['traits'].items())}"] if plan["traits"] else []),
+            *([f"Only rank {plan['rank']} or better"] if plan["rank"] else []),
             f"Bought so far: {plan['bought']} for {fmt_native(plan['spent'], chain_id)} ({plan['tried']} attempts)",
             "Buyers:",
         ]
@@ -398,6 +425,48 @@ class TradeMixin:
         if self.dry:
             lines.append("🧪 Dry run is on: nothing will be sent.")
         return "\n".join(lines)
+
+    def record_buy(self, chain_id, wallet, contract, token_id, value, txh):
+        """Remember what a purchase cost, gas included when the receipt can be read."""
+        try:
+            cost = self.mint_cost(chain_id, txh, value)
+            self.ledger_add("buy", chain_id, wallet, contract, cost if cost is not None else value, token_id)
+        except Exception as exc:
+            self.log(f"ledger {type(exc).__name__}: {exc}")
+
+    def sweep_wait(self):
+        """Wait for the next look at the collection: the live feed wakes it at once, polling is the safety net."""
+        stream = self.stream
+        if stream and stream.live and self.setting("stream"):
+            stream.changed.wait(max(self.sweep_poll, 20))
+            stream.changed.clear()
+        else:
+            self.sweep_stop.wait(self.sweep_poll)
+
+    def pull_all(self, args, prefixes):
+        found = []
+        while True:
+            value = self.pull_option(args, prefixes)
+            if value is None:
+                return found
+            found.append(value)
+
+    def sweep_matches(self, plan, row):
+        """True if the listed NFT passes the sweep's trait and rank filters. Raises OpenSeaError when OpenSea cannot say."""
+        if not plan["traits"] and not plan["rank"]:
+            return True
+        key = f"{row['contract']}:{row['token_id']}"
+        details = plan["details"].get(key)
+        if details is None:
+            details = self.opensea.nft_details(plan["slug"], row["contract"], row["token_id"])
+            plan["details"][key] = details
+        for trait, value in plan["traits"].items():
+            if details["traits"].get(trait) != value:
+                return False
+        if plan["rank"]:
+            if details["rank"] is None or details["rank"] > plan["rank"]:
+                return False
+        return True
 
     def run_sweep(self, plan):
         chain_id = plan["chain"]
@@ -435,6 +504,14 @@ class TradeMixin:
                         reason = "budget reached"
                         self.sweep_stop.set()
                         break
+                    try:
+                        if not self.sweep_matches(plan, row):
+                            plan["seen"].add(row["hash"])
+                            continue
+                    except opensea.OpenSeaError as exc:
+                        plan["error"] = str(exc)[:160]
+                        plan["later"][row["hash"]] = time.time() + 30
+                        continue
                     sub = {"slug": plan["slug"], "contract": row["contract"], "token": row["token_id"], "max": plan["max"]}
                     for step in range(len(wallets)):
                         acct = wallets[(turn + step) % len(wallets)]
@@ -503,11 +580,13 @@ class TradeMixin:
                     else:
                         # Every wallet was skipped (funds or price). Look at it again in a minute rather than every poll.
                         plan["later"][row["hash"]] = time.time() + 60
-                self.sweep_stop.wait(self.sweep_poll)
+                self.sweep_wait()
         except Exception as exc:
             reason = f"error: {type(exc).__name__}: {str(exc)[:120]}"
             self.log(f"sweep crashed {exc}")
         finally:
+            if self.stream:
+                self.stream.stop()
             self.alert(
                 f"Sweep ended: {reason}",
                 card(

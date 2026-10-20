@@ -6,10 +6,19 @@ Nothing here touches the network, Telegram or the bot's state, so it is safe to 
 from __future__ import annotations
 
 import html
+import os
 import re
 from decimal import Decimal
 
 from eth_utils import keccak, to_checksum_address
+
+
+def env(name, default=""):
+    return os.environ.get(name, default).strip().strip('"').strip("'")
+
+
+def flag(name, default="false"):
+    return env(name, default).lower() in ("1", "true", "yes", "on")
 
 TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
 

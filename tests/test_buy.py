@@ -201,6 +201,7 @@ class BuyCommandTests(unittest.TestCase):
              mock.patch.object(b, "fees", return_value=(10**9, 10**9)), \
              mock.patch.object(b, "simulate", side_effect=sim), \
              mock.patch.object(b, "land", return_value=land) as landed, \
+             mock.patch.object(b, "mint_cost", return_value=None), \
              mock.patch.object(b, "record_holdings_later") as record:
             plan = b.buy_plan
             plan["state"] = "running"

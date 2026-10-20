@@ -100,6 +100,7 @@ class SweepRunTests(unittest.TestCase):
              mock.patch.object(b, "fees", return_value=(10**9, 10**9)), \
              mock.patch.object(b, "simulate", side_effect=simulate), \
              mock.patch.object(b, "land", return_value=("0xtx", True, ["0xtx"])) as landed, \
+             mock.patch.object(b, "mint_cost", return_value=None), \
              mock.patch.object(b, "record_holdings_later"):
             b.run_sweep(plan)
         timer.cancel()

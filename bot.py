@@ -29,6 +29,8 @@ from eth_utils import keccak, to_checksum_address
 import opensea
 from helpers import *  # noqa: F401,F403
 from nftsend import SendMixin
+from market import MarketMixin
+from settings import SPEC as SETTING_SPEC, SettingsMixin
 from trade import TradeMixin
 
 LIFI = "https://li.quest/v1/quote"
@@ -144,12 +146,6 @@ CHAINS = {
 }
 
 
-def env(name, default=""):
-    return os.environ.get(name, default).strip().strip('"').strip("'")
-
-
-def flag(name, default="false"):
-    return env(name, default).lower() in ("1", "true", "yes", "on")
 
 
 def log(msg):
@@ -231,6 +227,12 @@ MENU = (
     ("sendnfts", "📦 Send all NFTs to one wallet"),
     ("buy", "🛒 Buy an NFT from an OpenSea link"),
     ("sweep", "🧹 Buy listings below a price"),
+    ("list", "🏷 List an NFT you hold"),
+    ("unlist", "🗑 Cancel the bot's listings"),
+    ("sellall", "💸 List everything you hold"),
+    ("offer", "🤝 Make an offer on an NFT"),
+    ("pnl", "📒 Profit and loss"),
+    ("settings", "⚙️ Auto-list and other settings"),
     ("help", "ℹ️ List every command"),
 )
 
@@ -471,7 +473,7 @@ def rewrite(data, old, new):
     return "0x" + data[2:].lower().replace(word(old), word(new))
 
 
-class Bot(TradeMixin, SendMixin):
+class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
     def log(self, *args, **kwargs):
         return log(*args, **kwargs)
 
@@ -544,6 +546,16 @@ class Bot(TradeMixin, SendMixin):
         self.minted_before = {}
         # chain:collection:wallet -> {"std": 721 or 1155, "ids": [token ids]} for NFTs the minters received.
         self.holdings = {}
+        # Settings changed from Telegram, OpenSea listings the bot manages, and what each NFT cost.
+        self._seaport = {}
+        self._fee_cache = {}
+        self._slug_cache = {}
+        self._sales_cache = {}
+        self.market_plan = None
+        self._market_lock = threading.Lock()
+        self.settings = {}
+        self.autolist = {}
+        self.ledger = []
         self._block_fails = {}
         self.refetch = {}
         self.send_plan = None
@@ -551,6 +563,7 @@ class Bot(TradeMixin, SendMixin):
         # OpenSea purchases. Needs OPENSEA_API_KEY. MAX_BUY_ETH caps the price of any single purchase.
         key = env("OPENSEA_API_KEY")
         self.opensea = opensea.OpenSea(key) if key else None
+        self.stream = opensea.Stream(key, url=env("OPENSEA_STREAM_URL") or None, log=log) if key else None
         self.max_buy = to_wei(env("MAX_BUY_ETH", "0.05"))
         self.buy_plan = None
         self.buy_cancel = threading.Event()
@@ -625,6 +638,9 @@ class Bot(TradeMixin, SendMixin):
                     continue
                 if std in (721, 1155) and ids and len(str(key).split(":")) == 3:
                     self.holdings[str(key)] = {"std": std, "ids": ids}
+            self.settings = {k: v for k, v in (data.get("settings") or {}).items() if k in SETTING_SPEC}
+            self.autolist = {str(k): v for k, v in (data.get("autolist") or {}).items() if isinstance(v, dict)}
+            self.ledger = [e for e in (data.get("ledger") or []) if isinstance(e, dict)]
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
             if isinstance(saved_watch, list) and saved_watch:
@@ -670,6 +686,12 @@ class Bot(TradeMixin, SendMixin):
             holdings = getattr(self, "holdings", None)
             if isinstance(holdings, dict) and holdings:
                 state["holdings"] = dict(holdings)
+            if getattr(self, "settings", None):
+                state["settings"] = dict(self.settings)
+            if getattr(self, "autolist", None):
+                state["autolist"] = dict(self.autolist)
+            if getattr(self, "ledger", None):
+                state["ledger"] = list(self.ledger[-3000:])
             if self.watch_saved:
                 state["watch"] = sorted(self.watch)
             if self.cap_overrides:
@@ -1492,6 +1514,18 @@ class Bot(TradeMixin, SendMixin):
             return self.buy_command(args)
         if command == "/sweep":
             return self.sweep_command(args)
+        if command == "/settings":
+            return self.settings_command(args)
+        if command == "/list":
+            return self.list_command(args)
+        if command == "/unlist":
+            return self.unlist_command(args)
+        if command == "/sellall":
+            return self.sellall_command(args)
+        if command == "/offer":
+            return self.offer_command(args)
+        if command == "/pnl":
+            return self.pnl_command(args)
         if command in ("/help", "/start"):
             lines = ["Tap / to open the menu.\n"]
             lines.extend(f"/{name}  {text}" for name, text in MENU)
@@ -1931,6 +1965,31 @@ class Bot(TradeMixin, SendMixin):
             kept.append((target, data, value))
         return kept
 
+    def premint_blocked(self, chain_id, want):
+        """Why a mint should be skipped by the sales filter, or "". New collections OpenSea does not know always pass."""
+        minimum = int(self.setting("premint_min_sales"))
+        if not minimum or not self.opensea or chain_id not in opensea.CHAIN_TO_SLUG:
+            return ""
+        reasons = []
+        for collection in want:
+            try:
+                slug = self.collection_slug_for(chain_id, collection)
+                if not slug:
+                    return ""
+                cached = self._sales_cache.get(slug)
+                if cached and time.time() - cached[0] < 600:
+                    sales = cached[1]
+                else:
+                    sales = self.opensea.collection_sales(slug)
+                    self._sales_cache[slug] = (time.time(), sales)
+            except Exception as exc:
+                log(f"sales filter could not check {collection}: {type(exc).__name__}")
+                return ""
+            if sales is None or sales >= minimum:
+                return ""
+            reasons.append(f"OpenSea shows {sales} sale(s), below your minimum of {minimum}")
+        return reasons[0] if reasons else ""
+
     def collection_name(self, chain_id, collection):
         """The collection's name() if it has one, cached so each contract is asked once."""
         key = f"{chain_id}:{collection.lower()}"
@@ -1941,6 +2000,11 @@ class Bot(TradeMixin, SendMixin):
                 name = decode_abi_string(raw)
             except Exception:
                 pass
+            if not name and self.opensea and self.setting("opensea_names") and chain_id in opensea.CHAIN_TO_SLUG:
+                try:
+                    name = self.opensea.contract_collection(opensea.CHAIN_TO_SLUG[chain_id], collection)[1] or ""
+                except Exception:
+                    name = ""
             self._names[key] = name
         return self._names[key]
 
@@ -1994,7 +2058,13 @@ class Bot(TradeMixin, SendMixin):
         for record in problems:
             reasons[record.get("reason") or "did not land"] = reasons.get(record.get("reason") or "did not land", 0) + 1
         skipped_text = "\n".join(f"• {count} minter(s): {esc(reason)}" for reason, count in reasons.items())
-        costs = [self.mint_cost(chain_id, r["txh"], r.get("value")) for r in minted if r.get("txh")]
+        costs = []
+        for who, record in report.items():
+            if record.get("status") == "minted" and record.get("txh"):
+                cost = self.mint_cost(chain_id, record["txh"], record.get("value"))
+                costs.append(cost)
+                if cost is not None and not self.dry:
+                    self.ledger_add("mint", chain_id, who, ",".join(want), cost)
         # Attempts that reverted still cost gas, so they count toward the total.
         for record in report.values():
             costs += [self.mint_cost(chain_id, h, 0) for h in record.get("failed_txs") or []]
@@ -2455,6 +2525,20 @@ class Bot(TradeMixin, SendMixin):
                     ),
                 )
                 return
+            why = self.premint_blocked(chain_id, want)
+            if why:
+                self.seen.add(key)
+                self._save()
+                alert(
+                    f"🚫 skipped {txh} on {self.chains[chain_id].name}: {why}",
+                    card(
+                        f"🚫 Skipped by your sales filter · {self.chains[chain_id].name}",
+                        ("Collection (CA)", "\n" + collections_html(want)),
+                        ("Why", esc(why)),
+                        ("Source tx", code(txh)),
+                    ),
+                )
+                return
             allowed, blocked = self.claim_collection_cooldown(chain_id, txh, want)
             if not allowed:
                 names = ", ".join(item[0].split(":", 1)[1] for item in blocked)
@@ -2701,6 +2785,8 @@ class Bot(TradeMixin, SendMixin):
             f"🤖 copymint-bot started ({state}): {len(self.watch)} wallet(s) on {names}, "
             f"dry run {'🧪 on' if self.dry else 'off'}"
         )
+        if self.opensea:
+            threading.Thread(target=self.autolist_loop, daemon=True).start()
         if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
             threading.Thread(target=self.control_loop, daemon=True).start()
             log("telegram controls enabled")
