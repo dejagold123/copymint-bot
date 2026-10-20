@@ -31,8 +31,9 @@ SLUG_TO_CHAIN = {
     "arbitrum": 42161,
     "hyperevm": 999,
     "robinhood": 4663,
+    "ink": 57073,
 }
-CHAIN_TO_SLUG = {1: "ethereum", 10: "optimism", 56: "bsc", 137: "matic", 8453: "base", 42161: "arbitrum", 999: "hyperevm", 4663: "robinhood"}
+CHAIN_TO_SLUG = {1: "ethereum", 10: "optimism", 56: "bsc", 137: "matic", 8453: "base", 42161: "arbitrum", 999: "hyperevm", 4663: "robinhood", 57073: "ink"}
 
 SEAPORT_16 = "0x0000000000000068F116a894984e2DB1123eB395"
 

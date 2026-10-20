@@ -143,6 +143,7 @@ CHAINS = {
     42161: ("Arbitrum", "https://arbitrum.publicnode.com"),
     999: ("HyperEVM", "https://rpc.hyperliquid.xyz/evm"),
     4663: ("Robinhood", "https://rpc.mainnet.chain.robinhood.com"),
+    57073: ("Ink", "https://rpc-gel.inkonchain.com"),
 }
 
 
@@ -505,12 +506,16 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         if self.funder:
             self.own.add(self.funder.address.lower())
 
-        selected = [int(x) for x in env("CHAINS", "1,10,56,137,8453,42161,999,4663").split(",") if x.strip()]
+        selected = [int(x) for x in env("CHAINS", "1,10,56,137,8453,42161,999,4663,57073").split(",") if x.strip()]
         chains = {}
         for cid in selected:
-            if cid not in CHAINS:
-                raise SystemExit(f"Unknown chain id {cid}")
-            name, default = CHAINS[cid]
+            if cid in CHAINS:
+                name, default = CHAINS[cid]
+            elif env(f"RPC_{cid}"):
+                # A chain the bot does not list: works when you give its RPC (and optionally CHAIN_NAME_<id>).
+                name, default = env(f"CHAIN_NAME_{cid}", f"Chain {cid}"), ""
+            else:
+                raise SystemExit(f"Unknown chain id {cid}. Set RPC_{cid} to use a chain the bot does not list.")
             wss = env(f"WSS_{cid}")
             if wss and not wss.startswith(("wss://", "ws://")):
                 # The value is not echoed, because the URL usually contains an API key.
