@@ -31,6 +31,8 @@ def make_bot(**env):
 
 def node(b, code=None, estimate=True, price=None):
     code = code if code is not None else "0x6080" + "63" + MINT_UINT + "00"
+    drop_selectors = (bot.GET_PUBLIC_DROP, bot.GET_ALLOWED_FEE_RECIPIENTS, bot.GET_CREATOR_PAYOUT)
+    price_selectors = tuple(bot.selector(sig) for sig in bot.PRICE_VIEWS)
 
     def call(chain_id, method, params):
         if method == "eth_getCode":
@@ -42,9 +44,18 @@ def node(b, code=None, estimate=True, price=None):
                 raise RuntimeError("execution reverted")
             return hex(100_000)
         if method == "eth_call":
-            if price is None:
+            data = ""
+            if params and isinstance(params[0], dict):
+                data = (params[0].get("data") or "").lower()
+            if data.startswith(drop_selectors):
                 raise RuntimeError("execution reverted")
-            return hex(price)
+            if data.startswith(price_selectors):
+                if price is None:
+                    raise RuntimeError("execution reverted")
+                return hex(price)
+            if not estimate:
+                raise RuntimeError("execution reverted")
+            return "0x"
         if method == "eth_getTransactionCount":
             return "0x5"
         if method in ("eth_gasPrice",):
@@ -512,3 +523,114 @@ class ChainChoice(unittest.TestCase):
         b.snipe_plan = None
         self.assertIn("⚠️", b.snipe_command([CONTRACT, "2", "42m", "fn=other(uint256)"]))
         self.assertIn("⚠️", b.snipe_command([CONTRACT, "2", "42m", "fn=weird(bytes)"]))
+
+
+class PublicDrop(unittest.TestCase):
+    def drop(self, **over):
+        start = int(over.get("start", bot.time.time() + 3600))
+        body = {"price": 2 * 10**14, "start": start, "end": start + 1800, "max": 1, "recipient": "0x" + "12" * 20}
+        body.update(over)
+        return body
+
+    def test_short_rpc_returns_are_not_a_drop(self):
+        self.assertIsNone(bot.decode_public_drop("0x"))
+        self.assertIsNone(bot.decode_public_drop(hex(10**15)))
+        self.assertIsNone(bot.decode_public_drop(None))
+
+    def test_a_six_word_drop_is_read(self):
+        words = [2 * 10**14, 100, 500, 3, 1000, 1]
+        raw = "0x" + "".join(f"{n:064x}" for n in words)
+        self.assertEqual(bot.decode_public_drop(raw), {"price": 2 * 10**14, "start": 100, "end": 500, "max": 3})
+
+    def test_open_sets_the_fire_time_to_the_drop(self):
+        b = node(make_bot())
+        drop = self.drop()
+        b.public_drop = lambda *a, **k: drop
+        text = b.command_reply("/snipe", [CONTRACT, "1", "open"])
+        self.assertIn("mintPublic", text)
+        self.assertIn("Nothing is broadcast", text)
+        self.assertEqual(b.snipe_plan["fire_at"], drop["start"])
+        self.assertEqual(b.snipe_plan["target"], bot.SEADROP)
+        self.assertEqual(b.snipe_plan["value"], drop["price"])
+        self.assertTrue(b.snipe_plan["calldata"].startswith(bot.MINT_PUBLIC))
+        self.assertNotIn(bot.selector("mint(uint256)"), b.snipe_plan["calldata"])
+
+    def test_open_without_a_drop_is_refused(self):
+        b = node(make_bot())
+        text = b.command_reply("/snipe", [CONTRACT, "1", "open"])
+        self.assertIn("no SeaDrop", text)
+        self.assertIsNone(b.snipe_plan)
+
+    def test_an_early_countdown_moves_to_the_drop_start(self):
+        b = node(make_bot())
+        drop = self.drop()
+        b.public_drop = lambda *a, **k: drop
+        b.command_reply("/snipe", [CONTRACT, "1", "0", "20m"])
+        self.assertEqual(b.snipe_plan["fire_at"], drop["start"])
+        self.assertEqual(b.snipe_plan["target"], bot.SEADROP)
+        self.assertTrue(b.snipe_plan["calldata"].startswith(bot.MINT_PUBLIC))
+
+
+class ClosedSale(unittest.TestCase):
+    def test_a_reverting_call_sends_nothing(self):
+        b = make_bot()
+        report = {}
+        acct = b.minters[0]
+        sent = []
+
+        def call(chain_id, method, params):
+            if method == "eth_sendRawTransaction":
+                sent.append(params[0])
+                return "0xtx"
+            if method == "eth_call":
+                raise RuntimeError("execution reverted: not live")
+            if method == "eth_getTransactionCount":
+                return "0x1"
+            return None
+
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = call
+        with mock.patch.object(bot, "log"):
+            b.snipe_worker(acct, sample_plan(b), 5, 2 * 10**9, 10**9, None, bot.time.time() + 0.35, report)
+        record = report[acct.address.lower()]
+        self.assertEqual(sent, [])
+        self.assertEqual(record["failed_txs"], [])
+        self.assertIn("nothing was sent", record["reason"])
+
+    def test_it_sends_once_the_call_starts_succeeding(self):
+        b = make_bot()
+        report = {}
+        acct = b.minters[0]
+        sent = []
+        probes = {"n": 0}
+
+        def call(chain_id, method, params):
+            if method == "eth_call":
+                probes["n"] += 1
+                if probes["n"] < 3:
+                    raise RuntimeError("execution reverted")
+                return "0x"
+            if method == "eth_sendRawTransaction":
+                sent.append(params[0])
+                return "0xtx1"
+            if method == "eth_getTransactionReceipt":
+                return {"status": "0x1"}
+            if method == "eth_getTransactionCount":
+                return "0x3"
+            return None
+
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = call
+        with mock.patch.object(bot, "log"):
+            b.snipe_worker(acct, sample_plan(b), None, 2 * 10**9, 10**9, None, bot.time.time() + 2, report)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(report[acct.address.lower()]["status"], "minted")
+
+    def test_an_rpc_blip_is_retried_instead_of_forgotten(self):
+        b = make_bot()
+        b.simulate = lambda *a, **k: "temporary"
+        tx = {"hash": "0x" + "ab" * 32, "from": WATCHED, "to": CONTRACT, "value": "0x0", "input": "0x1234"}
+        with mock.patch.object(bot, "notify"), mock.patch.object(bot, "log"):
+            b.copy(4663, tx, {CONTRACT.lower(): 1}, options=[(CONTRACT, bot.selector("mint(uint256)") + "0" * 64, 0)])
+        self.assertNotIn(f"4663:{tx['hash']}", b.seen)
+        self.assertIn(f"4663:{tx['hash']}", b.pending)
