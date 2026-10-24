@@ -62,6 +62,12 @@ MINT_OK = {
     selector("claim(address,uint256)"),
     selector("purchase(uint256)"),
 }
+SEADROP = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"
+GET_PUBLIC_DROP = selector("getPublicDrop(address)")
+GET_ALLOWED_FEE_RECIPIENTS = selector("getAllowedFeeRecipients(address)")
+GET_CREATOR_PAYOUT = selector("getCreatorPayoutAddress(address)")
+MINT_PUBLIC = selector("mintPublic(address,address,address,uint256)")
+ZERO_ADDRESS = "0x" + "00" * 20
 SEADROP_MINT_SIGNED = selector(
     "mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)"
 )
@@ -381,6 +387,46 @@ def single_qty(data):
     if not data or len(data) < 2 + 128:
         return 1
     return int(data[2 + 64 : 2 + 128], 16)
+
+
+def decode_public_drop(raw):
+    """PublicDrop from SeaDrop.getPublicDrop, or None when this NFT has no public sale."""
+    if not isinstance(raw, str) or len(raw) < 2 + 64 * 6:
+        return None
+    try:
+        words = [int(raw[2 + i * 64 : 2 + (i + 1) * 64], 16) for i in range(6)]
+    except ValueError:
+        return None
+    price, start, end, max_wallet, _fee_bps, _restrict = words
+    if end <= start or price > 1000 * 10**18:
+        return None
+    return {"price": price, "start": start, "end": end, "max": max_wallet}
+
+
+def decode_address_array(raw):
+    if not isinstance(raw, str) or len(raw) < 2 + 128:
+        return []
+    try:
+        body = bytes.fromhex(raw[2:])
+        offset = int.from_bytes(body[0:32], "big")
+        count = int.from_bytes(body[offset : offset + 32], "big")
+    except (ValueError, IndexError):
+        return []
+    if count > 20:
+        return []
+    out = []
+    for i in range(count):
+        word_at = offset + 32 + 32 * i
+        word_bytes = body[word_at : word_at + 32]
+        if len(word_bytes) < 32:
+            break
+        out.append("0x" + word_bytes[-20:].hex())
+    return out
+
+
+def mint_public_data(nft, recipient, qty):
+    """SeaDrop.mintPublic calldata. address(0) means the sender is the minter."""
+    return MINT_PUBLIC + word(nft) + word(recipient) + word(ZERO_ADDRESS) + f"{int(qty):064x}"
 
 
 def batch_qty(data):
@@ -785,6 +831,84 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             self._save()
         return "\n".join(lines)
 
+    def public_drop(self, chain_id, nft):
+        """SeaDrop public sale for an NFT, or None. Includes the fee recipient the mint must name."""
+        try:
+            raw = self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(SEADROP), "data": GET_PUBLIC_DROP + word(nft)}, "latest"])
+        except Exception:
+            return None
+        drop = decode_public_drop(raw)
+        if not drop:
+            return None
+        recipient = None
+        try:
+            raw = self.rpc.call(
+                chain_id, "eth_call",
+                [{"to": to_checksum_address(SEADROP), "data": GET_ALLOWED_FEE_RECIPIENTS + word(nft)}, "latest"],
+            )
+            recipients = [a for a in decode_address_array(raw) if int(a, 16)]
+            recipient = recipients[0] if recipients else None
+        except Exception:
+            recipient = None
+        if not recipient:
+            try:
+                raw = self.rpc.call(
+                    chain_id, "eth_call",
+                    [{"to": to_checksum_address(SEADROP), "data": GET_CREATOR_PAYOUT + word(nft)}, "latest"],
+                )
+                if isinstance(raw, str) and len(raw) >= 66 and int(raw[-40:], 16):
+                    recipient = "0x" + raw[-40:]
+            except Exception:
+                recipient = None
+        if not recipient:
+            return None
+        drop["recipient"] = recipient
+        return drop
+
+    def mint_call_ready(self, chain_id, acct, target, data, value):
+        """True if eth_call accepts this mint, False if the contract reverts, None if the node could not say.
+
+        A balance override is tried first so an empty wallet is not mistaken for a closed sale.
+        """
+        call = {"from": acct.address, "to": to_checksum_address(target), "data": data, "value": hex(int(value))}
+        override = {acct.address: {"balance": SIM_BALANCE}}
+        errors = []
+        for params in ([call, "latest", override], [call, "latest"]):
+            try:
+                result = self.rpc.call(chain_id, "eth_call", params)
+            except Exception as exc:
+                errors.append(exc)
+                continue
+            if result is None:
+                return None
+            return True
+        text = " ".join(str(exc).lower() for exc in errors)
+        if "revert" in text:
+            self._note_revert(str(errors[-1]))
+            return False
+        if "insufficient" in text or "funds" in text:
+            # The call itself was not rejected; the wallet just cannot pay yet.
+            return True
+        return None
+
+    def implementation_address(self, chain_id, contract, code=None):
+        """The implementation behind an EIP-1167 clone or an EIP-1967 proxy, or None."""
+        if code is None:
+            try:
+                code = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"]) or "0x"
+            except Exception:
+                return None
+        code = (code or "0x").lower()
+        if code.startswith("0x363d3d373d3d3d363d73") and len(code) >= 62:
+            return "0x" + code[22:62]
+        try:
+            slot = self.rpc.call(chain_id, "eth_getStorageAt", [to_checksum_address(contract), EIP1967_IMPLEMENTATION_SLOT, "latest"])
+        except Exception:
+            return None
+        if slot and int(slot, 16):
+            return "0x" + slot[-40:]
+        return None
+
     def manual_options(self, chain_id, contract, qty, price_wei=None):
         """The calls /mint will try. Each minter simulates them and uses the first that gives it the NFTs."""
         cap = self.cap(chain_id)
@@ -813,6 +937,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             options.append((contract, selector(signature) + words, value))
         if value > 0:
             options.append((contract, "0x", value))
+        drop = self.public_drop(chain_id, contract)
+        if drop and time.time() <= drop["end"]:
+            paid = drop["price"] * qty
+            if paid <= cap:
+                # OpenSea drops mint through SeaDrop, not mint() on the NFT. Try that first.
+                options.insert(0, (SEADROP, mint_public_data(contract, drop["recipient"], qty), paid))
         return options
 
     def pull_option(self, args, prefixes):
@@ -834,7 +964,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             "✏️ Usage: /mint [CHAIN_ID] 0xCONTRACT [QUANTITY] [PRICE_PER_NFT] [wallets=1,3]\n"
             "Example: /mint 4663 0xabc… 2 0.001\n"
             "Add wallets=1,3 to use only those minters (numbers as /minters lists them). Default is all.\n"
-            "Add chain=robinhood if more than one chain is enabled and the address is on several."
+            "Add chain=robinhood if more than one chain is enabled and the address is on several.\n"
+            "A SeaDrop drop is minted through SeaDrop, not mint() on the NFT. If the public sale has not opened, this tells you when and how to schedule it."
         )
         if not args:
             return usage
@@ -892,6 +1023,28 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             return "⚠️ Could not reach the chain's RPC. Try again."
         if not code_at or code_at in ("0x", "0x0"):
             return "⚠️ There is no contract at that address on this chain."
+        drop = self.public_drop(chain_id, contract)
+        if drop and drop["price"] * qty > self.cap(chain_id):
+            return (
+                f"⚠️ The SeaDrop public price is {fmt_native(drop['price'], chain_id)} each "
+                f"({fmt_native(drop['price'] * qty, chain_id)} for {qty}), above your cap of {fmt_native(self.cap(chain_id), chain_id)}. "
+                "Raise it with /cap first."
+            )
+        if drop and time.time() > drop["end"]:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(drop["end"]))
+            return (
+                f"⚠️ This SeaDrop public sale ended at {when} UTC. "
+                "Sending mint() on the NFT would revert."
+            )
+        if drop and time.time() < drop["start"]:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(drop["start"]))
+            return (
+                f"⏳ This is a SeaDrop public mint. It is not open yet.\n"
+                f"Opens: {when} UTC\n"
+                f"Price: {fmt_native(drop['price'], chain_id)} each, max {drop['max']} per wallet\n"
+                f"Schedule it with /snipe {contract} {qty} open\n"
+                "That waits until the sale opens and only then sends. Sending now would revert."
+            )
         job = (chain_id, contract, qty, price_wei)
         if len(accounts) != len(self.minters):
             job += ([a.address for a in accounts],)
@@ -900,8 +1053,11 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         who = f"{len(self.minters)} minter(s)" if len(accounts) == len(self.minters) else "minter " + ", ".join(
             f"#{self.minters.index(a) + 1}" for a in accounts
         )
+        price_note = ""
+        if drop and drop["start"] <= time.time() <= drop["end"]:
+            price_note = f" SeaDrop public price {fmt_native(drop['price'], chain_id)} each."
         return (
-            f"🎟 Minting {qty} from {contract} on {self.chains[chain_id].name} with {who}{mode}.\n"
+            f"🎟 Minting {qty} from {contract} on {self.chains[chain_id].name} with {who}{mode}.{price_note}\n"
             "A summary follows when it is done."
         )
 
@@ -916,25 +1072,19 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 "input": "0x",
             }
             with self._copy_lock:
-                self.copy(chain_id, tx, {contract: qty}, options=options, wallets=wallets)
+                self.copy(chain_id, tx, {contract: qty}, options=options, wallets=wallets, trust_call=True)
         except Exception as exc:
             log(f"/mint {contract} {type(exc).__name__}: {exc}")
             notify(f"⚠️ /mint failed: {type(exc).__name__}")
 
     def mint_functions_in(self, chain_id, contract):
-        """Known mint functions found in the contract's code, following a proxy to its implementation."""
-        code_at = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"]) or "0x"
+        """Known mint functions found in the contract's code, following a clone or proxy to its implementation."""
+        try:
+            code_at = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"]) or "0x"
+        except Exception:
+            code_at = "0x"
         blobs = [code_at.lower()]
-        implementation = None
-        if code_at.lower().startswith("0x363d3d373d3d3d363d73") and len(code_at) >= 62:
-            implementation = "0x" + code_at[22:62]
-        else:
-            try:
-                slot = self.rpc.call(chain_id, "eth_getStorageAt", [to_checksum_address(contract), EIP1967_IMPLEMENTATION_SLOT, "latest"])
-                if slot and int(slot, 16):
-                    implementation = "0x" + slot[-40:]
-            except Exception:
-                pass
+        implementation = self.implementation_address(chain_id, contract, code_at)
         if implementation:
             try:
                 blobs.append((self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(implementation), "latest"]) or "0x").lower())
@@ -1015,62 +1165,94 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         except Exception:
             return None
         blobs = [code]
-        try:
-            slot = self.rpc.call(chain_id, "eth_getStorageAt", [to_checksum_address(contract), EIP1967_IMPLEMENTATION_SLOT, "latest"])
-            if slot and int(slot, 16):
-                blobs.append((self.rpc.call(chain_id, "eth_getCode", [to_checksum_address("0x" + slot[-40:]), "latest"]) or "").lower())
-        except Exception:
-            pass
+        implementation = self.implementation_address(chain_id, contract, code)
+        if implementation:
+            try:
+                blobs.append((self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(implementation), "latest"]) or "").lower())
+            except Exception:
+                pass
         if selector(signature)[2:] not in "".join(blobs):
             return None
         return (signature, layout)
 
-    def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None, accounts=None):
+    def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None, accounts=None, drop_time=False):
         """Work out the mint call, price and gas before the mint opens. Returns (plan, error)."""
+        drop = None if override else self.public_drop(chain_id, contract)
+        if drop_time and not drop:
+            return None, (
+                "⚠️ There is no SeaDrop public sale on this contract, so open has no start time. "
+                "Use a countdown such as 10m, or /mint once the sale is open."
+            )
+        if drop and time.time() > drop["end"]:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(drop["end"]))
+            return None, f"⚠️ The SeaDrop public sale on this contract ended at {when} UTC."
+        note = ""
+        target = contract
+        calldata = None
         found = [(sig, layout) for sig, layout in self.mint_functions_in(chain_id, contract) if not (sig == "mint()" and qty != 1)]
         if override and not any(sig == override for sig, _ in found):
             custom = self.custom_call(chain_id, contract, override)
             if custom:
                 found = [custom]
-        if not found:
-            chain_name = self.chains[chain_id].name
-            return None, (
-                f"⚠️ I could not find a standard mint function in that contract on {chain_name} (chain {chain_id}), so I cannot prepare it.\n"
-                f"If {chain_name} is the wrong chain, add chain=NAME to the command.\n"
-                "If it is the right chain, the contract uses a custom mint function. Add fn=NAME(types) if you know it, "
-                "for example fn=publicMint(uint256), or use /mint once the mint is open."
-            )
-        if override:
-            matches = [item for item in found if item[0] == override]
-            if not matches:
-                names = ", ".join(sig for sig, _ in found)
-                return None, f"⚠️ {override} was not found in that contract. Functions I can use: {names}."
-            found = matches
-        signature, layout = found[0]
-        others = [sig for sig, _ in found[1:]]
-        if price_wei is None:
-            unit = 0
-            for view in PRICE_VIEWS:
-                try:
-                    unit = as_int(self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(contract), "data": selector(view)}, "latest"]))
-                except Exception:
-                    continue
-                if unit:
-                    break
-            value = unit * qty
+        if drop and not override:
+            signature, layout = "SeaDrop mintPublic", "seadrop"
+            others = []
+            value = drop["price"] * qty
+            if price_wei is not None and price_wei != drop["price"]:
+                note = f"Using the contract's public price {fmt_native(drop['price'], chain_id)}, not the price in the command."
+            target = SEADROP
+            calldata = mint_public_data(contract, drop["recipient"], qty)
+            found = [(signature, layout)]
         else:
-            value = price_wei * qty
+            if not found:
+                chain_name = self.chains[chain_id].name
+                return None, (
+                    f"⚠️ I could not find a standard mint function in that contract on {chain_name} (chain {chain_id}), so I cannot prepare it.\n"
+                    f"If {chain_name} is the wrong chain, add chain=NAME to the command.\n"
+                    "If it is the right chain, the contract uses a custom mint function. Add fn=NAME(types) if you know it, "
+                    "for example fn=publicMint(uint256), or use /mint once the mint is open."
+                )
+            if override:
+                matches = [item for item in found if item[0] == override]
+                if not matches:
+                    names = ", ".join(sig for sig, _ in found)
+                    return None, f"⚠️ {override} was not found in that contract. Functions I can use: {names}."
+                found = matches
+            signature, layout = found[0]
+            others = [sig for sig, _ in found[1:]]
+            if price_wei is None:
+                unit = 0
+                for view in PRICE_VIEWS:
+                    try:
+                        unit = as_int(self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(contract), "data": selector(view)}, "latest"]))
+                    except Exception:
+                        continue
+                    if unit:
+                        break
+                value = unit * qty
+            else:
+                value = price_wei * qty
         if value > self.cap(chain_id):
             return None, (
                 f"⚠️ The total price {fmt_native(value, chain_id)} is above your cap of {fmt_native(self.cap(chain_id), chain_id)}. "
                 "Raise it with /cap first."
             )
+        now = time.time()
+        fire_at = now + delay
+        if drop:
+            opens = drop["start"]
+            if drop_time or fire_at < opens:
+                fire_at = max(opens, now + SNIPE_PREP_SECONDS + 15)
+                when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(opens))
+                note = (note + " " if note else "") + f"Public sale opens {when} UTC. Nothing is sent before the contract accepts the mint."
+            elif now < opens:
+                note = (note + " " if note else "") + "Nothing is sent until the contract accepts the mint."
         accounts = list(accounts or self.minters)
         first = accounts[0]
-        data = self.snipe_call_data(signature, layout, qty, first.address)
+        data = calldata or self.snipe_call_data(signature, layout, qty, first.address)
         gas_note = "default"
         try:
-            estimate = as_int(self.rpc.call(chain_id, "eth_estimateGas", [{"from": first.address, "to": to_checksum_address(contract), "data": data, "value": hex(value)}]))
+            estimate = as_int(self.rpc.call(chain_id, "eth_estimateGas", [{"from": first.address, "to": to_checksum_address(target), "data": data, "value": hex(value)}]))
             gas, gas_note = int(estimate * 1.5) + 20_000, "estimated"
         except Exception:
             gas = 100_000 + 120_000 * qty
@@ -1079,18 +1261,24 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         plan = {
             "chain": chain_id,
             "contract": contract,
+            "target": target,
             "qty": qty,
             "value": value,
             "signature": signature,
             "layout": layout,
+            "calldata": calldata,
+            "candidates": found,
             "gas": gas,
             "gas_note": gas_note,
-            "fire_at": time.time() + delay,
+            "fire_at": fire_at,
             "attempts": attempts,
-            "worst": attempts * gas * fee,
+            "worst": gas * fee,
             "others": others,
             "wallets": [a.address.lower() for a in accounts],
             "state": "planned",
+            "note": note.strip(),
+            "nft": contract if drop else None,
+            "drop_end": drop["end"] if drop else None,
         }
         return plan, None
 
@@ -1116,12 +1304,13 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             f"Contract: {plan['contract']}\n"
             f"Call: {plan['signature']}, {plan['qty']} each, {price}\n"
             + (f"Other mint functions found: {', '.join(plan['others'])}. Add fn=NAME(types) to the command to pick another.\n" if plan.get("others") else "")
+            + (f"{plan['note']}\n" if plan.get("note") else "")
             + f"Minters: {self.plan_wallets_text(plan)}\n"
             f"Starts in: {seconds}s\n"
-            f"Sends at the start, then retries every {self.snipe_retry:g}s for up to {self.snipe_window:g}s, "
-            f"at most {plan['attempts']} tries per minter\n"
+            f"Nothing is broadcast while the contract reverts the mint. "
+            f"Once it accepts the call, a reverted transaction is retried every {self.snipe_retry:g}s until the window ends.\n"
             f"{gas_line}\n"
-            f"Worst case if every try fails: about {fmt_native(plan['worst'], plan['chain'])} in gas per minter\n"
+            f"Worst case if a sent try fails: about {fmt_native(plan['worst'], plan['chain'])} in gas per minter\n"
             + ("Dry run is on: nothing will be sent\n" if self.dry else "")
             + "\nSend /snipe confirm to arm it, or /snipe cancel."
         )
@@ -1131,7 +1320,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         usage = (
             "✏️ Usage: /snipe [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] TIME [wallets=1,3]\n"
             "QTY defaults to 1. PRICE is per NFT in the chain's coin and defaults to auto, which reads it from the contract.\n"
-            "TIME is a countdown such as 10m, 90s or 1h30m.\n"
+            "TIME is a countdown such as 10m, 90s or 1h30m, or open (also drop or public) to fire when the SeaDrop public sale starts.\n"
             "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
             "Shortest form: /snipe 0xabc… 42m wallets=1\n"
             "Add chain=robinhood (or the chain ID) if more than one chain is enabled and the address is on several.\n"
@@ -1193,9 +1382,16 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         if error:
             return error
         delay = None
+        drop_time = False
         for index, token in enumerate(args):
             if token.lower() == "in":
                 continue
+            if token.lower() in ("open", "drop", "public"):
+                first = index - 1 if index and args[index - 1].lower() == "in" else index
+                drop_time = True
+                delay = SNIPE_PREP_SECONDS + 15
+                del args[first : index + 1]
+                break
             seconds = parse_countdown([token])
             if seconds is not None:
                 first = index - 1 if index and args[index - 1].lower() == "in" else index
@@ -1204,7 +1400,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 break
         if delay is None:
             return "⚠️ I could not read the countdown.\n" + usage
-        if delay < SNIPE_PREP_SECONDS + 10:
+        if not drop_time and delay < SNIPE_PREP_SECONDS + 10:
             return "⚠️ The countdown must be at least 15 seconds."
         position = next((i for i, token in enumerate(args) if valid_address(token)), None)
         if position is None:
@@ -1267,7 +1463,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         if not code_at or code_at in ("0x", "0x0"):
             return "⚠️ There is no contract at that address on this chain."
         try:
-            plan, error = self.build_snipe_plan(chain_id, contract, qty, price_wei, delay, override, accounts)
+            plan, error = self.build_snipe_plan(chain_id, contract, qty, price_wei, delay, override, accounts, drop_time)
         except Exception as exc:
             log(f"snipe plan {type(exc).__name__}: {exc}")
             return "⚠️ Could not prepare the plan. Try again."
@@ -1286,8 +1482,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             if self.snipe_cancel.wait(min(remaining, 0.25 if remaining > 0.5 else 0.002)):
                 return False
 
-    def snipe_sign(self, chain_id, acct, plan, nonce, fee, tip):
-        data = self.snipe_call_data(plan["signature"], plan["layout"], plan["qty"], acct.address)
+    def snipe_sign(self, chain_id, acct, plan, nonce, fee, tip, target=None, data=None):
+        if data is None:
+            # SeaDrop calldata is the same for every minter (msg.sender is the minter). Never walk a "seadrop" layout.
+            data = plan.get("calldata") or self.snipe_call_data(plan["signature"], plan["layout"], plan["qty"], acct.address)
+        if target is None:
+            target = plan.get("target") or plan["contract"]
         signed = acct.sign_transaction(
             {
                 "chainId": chain_id,
@@ -1295,7 +1495,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 "gas": plan["gas"],
                 "maxFeePerGas": fee,
                 "maxPriorityFeePerGas": tip,
-                "to": to_checksum_address(plan["contract"]),
+                "to": to_checksum_address(target),
                 "value": plan["value"],
                 "data": data,
                 "type": 2,
@@ -1303,18 +1503,64 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         )
         return "0x" + signed.raw_transaction.hex()
 
+    def snipe_option(self, acct, plan):
+        """The mint call to send, or None while every candidate still reverts.
+
+        A node that cannot answer (eth_call returns nothing and does not revert) is not treated as a closed sale,
+        so the first candidate is sent. That keeps a plain mint working on a node with no eth_call result.
+        """
+        found = plan.get("candidates") or [(plan["signature"], plan.get("layout") or "q")]
+        first = None
+        unknown = False
+        reverted = False
+        for signature, layout in found:
+            if plan.get("calldata") and layout == "seadrop":
+                data = plan["calldata"]
+                target = plan.get("target") or SEADROP
+            else:
+                data = self.snipe_call_data(signature, layout, plan["qty"], acct.address)
+                target = plan["contract"]
+            packed = (target, data)
+            if first is None:
+                first = packed
+            state = self.mint_call_ready(plan["chain"], acct, target, data, plan["value"])
+            if state is True:
+                return packed
+            if state is False:
+                reverted = True
+            else:
+                unknown = True
+        if unknown and not reverted:
+            return first
+        return None
+
     def snipe_worker(self, acct, plan, nonce, fee, tip, first_raw, deadline, report):
-        """Send one minter's mint at the start, then retry after each reverted try until it lands or time runs out."""
+        """Wait until the mint call succeeds, then send. A closed sale is not broadcast."""
         chain_id = plan["chain"]
         who = acct.address.lower()
         failed, last, reason = [], None, "did not land in time"
         raw = first_raw
+        ready = None
         while True:
+            if last is None and raw is None and self.snipe_cancel.is_set():
+                reason = "cancelled"
+                break
+            if last is None and raw is None and ready is None:
+                ready = self.snipe_option(acct, plan)
+                if ready is None:
+                    if time.time() >= deadline:
+                        reason = "the mint call reverted the whole time, so nothing was sent"
+                        break
+                    time.sleep(self.snipe_retry)
+                    continue
             if last is None:
                 try:
-                    if raw is None:
-                        raw = self.snipe_sign(chain_id, acct, plan, nonce, fee, tip)
-                    last = self.rpc.call(chain_id, "eth_sendRawTransaction", [raw])
+                    with self._copy_lock:
+                        if raw is None:
+                            if nonce is None:
+                                nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+                            raw = self.snipe_sign(chain_id, acct, plan, nonce, fee, tip, ready[0], ready[1])
+                        last = self.rpc.call(chain_id, "eth_sendRawTransaction", [raw])
                 except Exception as exc:
                     reason = f"sending failed: {str(exc)[:80]}"
                     log(f"snipe {acct.address[:8]} {reason}")
@@ -1332,16 +1578,26 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                     receipt = None
                 if receipt:
                     if as_int(receipt.get("status", "0x1")) == 1:
-                        report[who] = {"status": "minted", "txh": last, "value": plan["value"], "failed_txs": failed}
-                        self.remember_minted(chain_id, acct.address, {plan["contract"]: plan["qty"]})
-                        self.record_holdings_later(chain_id, acct.address, last)
-                        return
-                    failed.append(last)  # reverted, most likely because the mint is not open yet
-                    reason = "every try reverted"
-                    nonce += 1
-                    last = None
-                    if time.time() < deadline:
-                        continue
+                        nft = (plan.get("nft") or "").lower()
+                        logs = receipt.get("logs") or []
+                        if nft and logs and nft not in self.minted_for(logs, acct.address):
+                            failed.append(last)
+                            reason = "the transaction landed but did not mint this collection"
+                            nonce = (nonce or 0) + 1
+                            last = None
+                            ready = None
+                        else:
+                            report[who] = {"status": "minted", "txh": last, "value": plan["value"], "failed_txs": failed}
+                            self.remember_minted(chain_id, acct.address, {plan["contract"]: plan["qty"]})
+                            self.record_holdings_later(chain_id, acct.address, last)
+                            return
+                    else:
+                        failed.append(last)  # the sale accepted the call, then the transaction reverted
+                        reason = "every try reverted"
+                        nonce = (nonce or 0) + 1
+                        last = None
+                        if time.time() < deadline:
+                            continue
             if time.time() >= deadline:
                 break
             time.sleep(self.snipe_retry)
@@ -1376,21 +1632,20 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             else:
                 self.rpc.call(chain_id, "eth_chainId", [])  # keeps the connection warm
                 fee, tip = self.fees(chain_id)
-                prepared = []
-                for acct in active:
-                    nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
-                    prepared.append((acct, nonce, self.snipe_sign(chain_id, acct, plan, nonce, fee, tip)))
                 if not self.snipe_wait(plan["fire_at"]):
                     return
-                deadline = time.time() + self.snipe_window
-                with self._copy_lock:
-                    with ThreadPoolExecutor(max_workers=max(1, len(prepared))) as pool:
-                        jobs = [
-                            pool.submit(self.snipe_worker, acct, plan, nonce, fee, tip, raw, deadline, report)
-                            for acct, nonce, raw in prepared
-                        ]
-                        for job in jobs:
-                            job.result()
+                deadline = plan["fire_at"] + self.snipe_window
+                drop_end = plan.get("drop_end")
+                if drop_end:
+                    deadline = max(deadline, min(drop_end, time.time() + 30 * 60))
+                # Do not hold _copy_lock across the wait. Each worker takes it only to sign and send.
+                with ThreadPoolExecutor(max_workers=max(1, len(active))) as pool:
+                    jobs = [
+                        pool.submit(self.snipe_worker, acct, plan, None, fee, tip, None, deadline, report)
+                        for acct in active
+                    ]
+                    for job in jobs:
+                        job.result()
             tx = {"hash": f"snipe-{int(plan['fire_at'])}", "from": "manual", "to": contract}
             self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report, "total": len(chosen)}, kind="snipe")
         except Exception as exc:
@@ -1914,12 +2169,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         except Exception as exc:
             if not method_missing(exc):
                 text = str(exc).lower()
-                if "revert" in text or "execution" in text:
+                # "execution reverted" counts. A bare timeout or "execution" error does not: that is a retry.
+                if "revert" in text:
                     self._note_revert(str(exc))
                     return None
-                if not method_missing(exc):
-                    log(f"simulate {exc}")
-                    return None
+                log(f"simulate {exc}")
+                return "temporary"
         try:
             result = self.rpc.call(
                 chain_id,
@@ -1940,7 +2195,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             if "revert" in str(exc).lower():
                 self._note_revert(str(exc))
                 return None
-            return "unsupported"
+            log(f"simulate {exc}")
+            return "temporary"
         if isinstance(result, dict) and result.get("error"):
             self._note_revert(result.get("error"), result.get("output"))
             return None
@@ -2201,9 +2457,36 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 reasons.append(classify_reason(text))
         return reasons[0] if reasons else ""
 
-    def pick(self, chain_id, acct, options, want):
+    def call_fallback(self, chain_id, acct, options, want):
+        """A mint eth_call accepts, used when the node cannot simulate. SeaDrop calldata is not rewritten."""
+        self._call_reverted = False
+        for target, raw, hinted in options:
+            data = raw if (raw or "")[:10].lower() == MINT_PUBLIC else self.rewrite_watched(raw, acct.address)
+            values = []
+            for value in (0, hinted):
+                if value not in values and value <= self.cap(chain_id):
+                    values.append(value)
+            for value in values:
+                state = self.mint_call_ready(chain_id, acct, target, data, value)
+                if state is True:
+                    gas = 200_000
+                    try:
+                        gas = int(self.rpc.call(
+                            chain_id, "eth_estimateGas",
+                            [{"from": acct.address, "to": to_checksum_address(target), "data": data, "value": hex(value)}],
+                        ), 16)
+                    except Exception:
+                        pass
+                    return value, target, data, max(gas, 80_000)
+                if state is False:
+                    self._call_reverted = True
+        return None
+
+    def pick(self, chain_id, acct, options, want, trust_call=False):
+        trust_call = bool(trust_call or getattr(self, "_trust_call", False))
         saw_real = False
         unsupported = False
+        temporary_rpc = False
         best = None
         reverted = 0
         different = 0
@@ -2211,7 +2494,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         self.last_pick_reason = ""
         self.last_pick_kind = ""
         for target, raw, hinted in options:
-            data = self.rewrite_watched(raw, acct.address)
+            data = raw if (raw or "")[:10].lower() == MINT_PUBLIC else self.rewrite_watched(raw, acct.address)
             values = []
             for value in (0, hinted):
                 if value not in values and value <= self.cap(chain_id):
@@ -2220,6 +2503,9 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 result = self.simulate(chain_id, acct, target, data, value)
                 if result == "unsupported":
                     unsupported = True
+                    continue
+                if result == "temporary":
+                    temporary_rpc = True
                     continue
                 saw_real = True
                 if not result:
@@ -2250,7 +2536,19 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 self.last_pick_reason = explained
             elif any(looks_signed(raw) or raw[:10].lower() == SEADROP_MINT_SIGNED for _t, raw, _v in options):
                 self.last_pick_reason = "not eligible: the mint needs a signature or allowlist proof made for the source wallet"
-        if not saw_real and unsupported:
+        if trust_call and (unsupported or temporary_rpc):
+            chosen = self.call_fallback(chain_id, acct, options, want)
+            if chosen:
+                self.last_pick_kind = "fallback"
+                return chosen
+            if getattr(self, "_call_reverted", False) or reverted:
+                self.last_pick_kind = self.last_pick_kind or "reverted"
+                self.last_pick_reason = self.last_pick_reason or "the mint call reverted"
+            elif not saw_real:
+                self.last_pick_kind = "temporary"
+                self.last_pick_reason = "the RPC could not confirm the mint call; it will be tried again"
+                return None
+        if not saw_real and unsupported and not temporary_rpc and self.last_pick_kind != "reverted":
             self.last_pick_kind = "unsupported"
             self.last_pick_reason = "your RPC cannot simulate; set a node with eth_simulateV1 or debug_traceCall"
             if self.allow_estimate:
@@ -2260,9 +2558,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                 f"Set RPC_{chain_id} to a node with eth_simulateV1 or debug_traceCall, "
                 "or set ALLOW_ESTIMATE_FALLBACK=true to send on a gas estimate alone."
             )
+        elif temporary_rpc and not saw_real and self.last_pick_kind != "reverted":
+            self.last_pick_kind = "temporary"
+            self.last_pick_reason = "the RPC could not simulate this mint; it will be tried again"
         return None
 
-    def copy(self, chain_id, tx, want, options=None, wallets=None):
+    def copy(self, chain_id, tx, want, options=None, wallets=None, trust_call=False):
         key = f"{chain_id}:{tx['hash']}"
         if key in self.seen:
             return
@@ -2280,6 +2581,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         }
         if wallets is not None and not item.get("wallets"):
             item["wallets"] = [w.lower() for w in wallets]
+        if "trust_call" not in item:
+            item["trust_call"] = bool(trust_call)
         accounts = [a for a in self.minters if not item.get("wallets") or a.address.lower() in item["wallets"]]
         item["total"] = len(accounts)
         if options is not None and not item.get("options"):
@@ -2324,7 +2627,15 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
                     report[who] = {"status": "minted", "txh": hit[0], "value": (report.get(who) or {}).get("value", 0)}
                     log(f"✅ OK {acct.address} {hit[0]}")
                     continue
-            chosen = self.pick(chain_id, acct, options, want)
+            self._trust_call = bool(item.get("trust_call"))
+            try:
+                chosen = self.pick(chain_id, acct, options, want)
+            finally:
+                self._trust_call = False
+            if not chosen and getattr(self, "last_pick_kind", "") == "temporary":
+                temporary = True
+                report[who] = {"status": "retrying", "reason": getattr(self, "last_pick_reason", "") or "the RPC could not simulate; it will be tried again"}
+                continue
             if not chosen and getattr(self, "last_pick_kind", "") == "reverted" and self.minted_before_any(chain_id, acct.address, want):
                 # The contract refuses a minter that already minted this collection, most likely a per-wallet limit.
                 log(f"skip {acct.address[:8]} already minted this collection and the contract now refuses, likely at its limit")
