@@ -232,3 +232,93 @@ def short_address(address):
 
 def word(addr):
     return addr[2:].lower().rjust(64, "0")
+
+
+ZONES = {
+    "utc": 0, "gmt": 0, "z": 0, "wat": 1, "cet": 1, "cest": 2, "eat": 3, "cat": 2, "ist": 5.5,
+    "est": -5, "edt": -4, "cst": -6, "cdt": -5, "mst": -7, "mdt": -6, "pst": -8, "pdt": -7,
+}
+CLOCK_RE = re.compile(r"(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?(am|pm)?")
+ZONE_RE = re.compile(r"(utc|gmt|z|wat|cet|cest|eat|cat|ist|est|edt|cst|cdt|mst|mdt|pst|pdt)?([+-]\d{1,2}(?::?\d{2})?)?")
+
+
+def zone_offset(token):
+    """Hours east of UTC for a zone word like UTC, WAT, EST or UTC+1, or None if it is not a zone."""
+    text = token.lower()
+    match = ZONE_RE.fullmatch(text)
+    if not match or not text or not (match.group(1) or match.group(2)):
+        return None
+    base = ZONES.get(match.group(1) or "utc", 0)
+    extra = 0.0
+    if match.group(2):
+        sign = -1 if match.group(2)[0] == "-" else 1
+        digits = match.group(2)[1:].replace(":", "")
+        hours = int(digits[:-2]) if len(digits) > 2 else int(digits)
+        minutes = int(digits[-2:]) if len(digits) > 2 else 0
+        if hours > 14 or minutes > 59:
+            return None
+        extra = sign * (hours + minutes / 60)
+    return base + extra
+
+
+def find_clock(args, now):
+    """A wall-clock start time in the words: '5pm UTC', 'at 17:30 WAT', '9:00 tomorrow'.
+
+    Returns (seconds from now, label, start index, end index) or None. With no zone it is read as UTC.
+    The next time that clock reads is used, so '5pm' after 5pm means tomorrow.
+    """
+    tokens = list(args)
+    for i, token in enumerate(tokens):
+        low = token.lower()
+        match = CLOCK_RE.fullmatch(low)
+        if not match:
+            continue
+        hour, minute, second, ampm = match.group(1), match.group(2), match.group(3), match.group(4)
+        end = i + 1
+        if not ampm and end < len(tokens) and tokens[end].lower() in ("am", "pm"):
+            ampm = tokens[end].lower()
+            end += 1
+        if not ampm and minute is None:
+            continue  # a bare number is a quantity or a price, not a time
+        hour = int(hour)
+        minute = int(minute or 0)
+        second = int(second or 0)
+        if ampm:
+            if not 1 <= hour <= 12:
+                continue
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        if hour > 23 or minute > 59 or second > 59:
+            continue
+        offset = 0.0
+        zone_text = "UTC"
+        if end < len(tokens):
+            zone = zone_offset(tokens[end])
+            if zone is not None:
+                offset, zone_text = zone, tokens[end].upper()
+                end += 1
+        start = i
+        day_shift = 0
+        while start > 0 and tokens[start - 1].lower() in ("at", "tomorrow"):
+            if tokens[start - 1].lower() == "tomorrow":
+                day_shift = 1
+            start -= 1
+        if end < len(tokens) and tokens[end].lower() == "tomorrow":
+            day_shift = 1
+            end += 1
+        local_now = now + offset * 3600
+        midnight = local_now - (local_now % 86400)
+        target = midnight + hour * 3600 + minute * 60 + second + day_shift * 86400 - offset * 3600
+        if not day_shift:
+            while target <= now:
+                target += 86400
+        label = f"{hour:02d}:{minute:02d}" + (f":{second:02d}" if second else "") + f" {zone_text}" + (" tomorrow" if day_shift else "")
+        return target - now, label, start, end
+    return None
+
+
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = [f"{hours}h" if hours else "", f"{minutes}m" if minutes else "", f"{secs}s" if secs or not (hours or minutes) else ""]
+    return "".join(parts)

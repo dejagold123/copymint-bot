@@ -1306,7 +1306,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             + (f"Other mint functions found: {', '.join(plan['others'])}. Add fn=NAME(types) to the command to pick another.\n" if plan.get("others") else "")
             + (f"{plan['note']}\n" if plan.get("note") else "")
             + f"Minters: {self.plan_wallets_text(plan)}\n"
-            f"Starts in: {seconds}s\n"
+            f"Starts in: {fmt_duration(seconds)}" + (f" (at {plan['when']})" if plan.get("when") else "") + "\n"
             f"Nothing is broadcast while the contract reverts the mint. "
             f"Once it accepts the call, a reverted transaction is retried every {self.snipe_retry:g}s until the window ends.\n"
             f"{gas_line}\n"
@@ -1323,6 +1323,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             "TIME is a countdown such as 10m, 90s or 1h30m, or open (also drop or public) to fire when the SeaDrop public sale starts.\n"
             "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
             "Shortest form: /snipe 0xabc… 42m wallets=1\n"
+            "A clock time works too: /snipe 0xabc… 3 0.00 5pm UTC wallet=2 (also 17:30 WAT or 9am EST; no zone means UTC, and it picks the next time the clock reads that).\n"
             "Add chain=robinhood (or the chain ID) if more than one chain is enabled and the address is on several.\n"
             "Add wallets=1,3 to use only those minters (numbers as /minters lists them), or wallets=all. Default is all.\n"
             "Then /snipe confirm to arm it, or /snipe cancel."
@@ -1383,7 +1384,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             return error
         delay = None
         drop_time = False
-        for index, token in enumerate(args):
+        when = ""
+        clock = find_clock(args, time.time())
+        if clock:
+            delay, when, first, last = clock
+            del args[first:last]
+        for index, token in enumerate(args if delay is None else []):
             if token.lower() == "in":
                 continue
             if token.lower() in ("open", "drop", "public"):
@@ -1469,6 +1475,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             return "⚠️ Could not prepare the plan. Try again."
         if error:
             return error
+        plan["when"] = when
         with self._snipe_lock:
             self.snipe_plan = plan
         return self.snipe_plan_text(plan)
