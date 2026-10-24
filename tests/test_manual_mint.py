@@ -76,6 +76,17 @@ class Options(unittest.TestCase):
         self.assertIn(WATCHED[2:], data)
         self.assertIn(minter[2:].lower(), b.rewrite_watched(data, minter).lower())
 
+    def test_a_public_drop_is_tried_before_mint_on_the_nft(self):
+        b = node(make_bot())
+        recipient = "0x" + "12" * 20
+        b.public_drop = lambda chain, nft: {"price": 2 * 10**14, "start": 1, "end": 10**12, "max": 1, "recipient": recipient}
+        options = b.manual_options(4663, CONTRACT, 1)
+        self.assertEqual(options[0][0], bot.SEADROP)
+        self.assertTrue(options[0][1].startswith(bot.MINT_PUBLIC))
+        self.assertIn(recipient[2:], options[0][1].lower())
+        self.assertEqual(options[0][2], 2 * 10**14)
+        self.assertNotIn(WATCHED[2:].lower(), options[0][1].lower())
+
 
 class Command(unittest.TestCase):
     def reply(self, b, args, started=None):
@@ -125,6 +136,17 @@ class Command(unittest.TestCase):
         started = []
         self.reply(b, [CONTRACT, "2", "0.001"], started)
         self.assertEqual(started[0].call_args.kwargs["args"], (4663, CONTRACT, 2, 10**15))
+
+    def test_a_closed_seadrop_sale_is_not_sent(self):
+        b = node(make_bot())
+        start = int(bot.time.time()) + 3600
+        b.public_drop = lambda *a, **k: {"price": 2 * 10**14, "start": start, "end": start + 1800, "max": 1, "recipient": "0x" + "12" * 20}
+        started = []
+        text = self.reply(b, [CONTRACT, "1"], started)
+        started[0].assert_not_called()
+        self.assertIn("/snipe", text)
+        self.assertIn("open", text)
+        self.assertIn("not open yet", text)
 
 
 class Running(unittest.TestCase):
