@@ -148,6 +148,32 @@ class Command(unittest.TestCase):
         self.assertIn("open", text)
         self.assertIn("not open yet", text)
 
+    def test_an_open_allowlist_is_minted_even_when_public_is_later(self):
+        b = node(make_bot())
+        start = int(bot.time.time()) + 3600
+        b.public_drop = lambda *a, **k: {"price": 2 * 10**14, "start": start, "end": start + 1800, "max": 1, "recipient": "0x" + "12" * 20}
+        gtd = {
+            "label": "Godlist (GTD)",
+            "kind": "SIGNED_PRESALE",
+            "start": int(bot.time.time()) - 10,
+            "end": start,
+            "eligible": True,
+            "max": 3,
+            "price_wei": 0,
+            "minted": 0,
+        }
+        b.phases_for = lambda chain, contract, accounts: [{"account": accounts[0], "stage": gtd, "stages": [gtd]}]
+        started = []
+        text = self.reply(b, [CONTRACT], started)
+        started[0].assert_called_once()
+        self.assertEqual(started[0].call_args.kwargs["target"], b.run_snipe)
+        plan = started[0].call_args.kwargs["args"][0]
+        self.assertEqual(plan["phase_kind"], "signed")
+        self.assertTrue(plan["immediate"])
+        self.assertNotIn("mintPublic", plan["signature"])
+        self.assertIn("Godlist", text)
+        self.assertNotIn("not open yet", text)
+
 
 class Running(unittest.TestCase):
     def test_the_mint_goes_through_the_normal_copy_path_with_a_manual_source(self):

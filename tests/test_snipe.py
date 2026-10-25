@@ -147,7 +147,7 @@ class Planning(unittest.TestCase):
     def test_bad_input_creates_no_plan(self):
         b = node(make_bot())
         for args in ([CONTRACT, "1", "0", "5s"], ["0x123", "1", "0", "10m"], [CONTRACT, "x", "0", "10m"], [CONTRACT, "0", "0", "10m"],
-                     [CONTRACT, "1", "abc", "10m"], [CONTRACT, "1", "-1", "10m"], [CONTRACT, "1", "0"], ["999", CONTRACT, "1", "0", "10m"]):
+                     [CONTRACT, "1", "abc", "10m"], [CONTRACT, "1", "-1", "10m"], ["999", CONTRACT, "1", "0", "10m"]):
             b.command_reply("/snipe", args)
             self.assertIsNone(b.snipe_plan, args)
 
@@ -634,3 +634,73 @@ class ClosedSale(unittest.TestCase):
             b.copy(4663, tx, {CONTRACT.lower(): 1}, options=[(CONTRACT, bot.selector("mint(uint256)") + "0" * 64, 0)])
         self.assertNotIn(f"4663:{tx['hash']}", b.seen)
         self.assertIn(f"4663:{tx['hash']}", b.pending)
+
+
+class AllowlistPhase(unittest.TestCase):
+    def stage(self, **over):
+        start = int(over.pop("start", bot.time.time() + 3600))
+        body = {
+            "label": "Godlist (GTD)",
+            "kind": "SIGNED_PRESALE",
+            "start": start,
+            "end": start + 3600,
+            "eligible": True,
+            "max": 3,
+            "price_wei": 0,
+            "minted": 0,
+        }
+        body.update(over)
+        return body
+
+    def test_the_contract_alone_schedules_the_allowlist_not_public(self):
+        b = node(make_bot())
+        gtd = self.stage()
+        public_start = gtd["start"] + 7200
+        b.public_drop = lambda *a, **k: {
+            "price": 5 * 10**15,
+            "start": public_start,
+            "end": public_start + 3600,
+            "max": 1,
+            "recipient": "0x" + "12" * 20,
+        }
+        b.phases_for = lambda chain, contract, accounts: [
+            {"account": a, "stage": gtd, "stages": [gtd]} for a in accounts
+        ]
+        text = b.command_reply("/snipe", [CONTRACT])
+        self.assertIn("Godlist", text)
+        self.assertNotIn("mintPublic", text)
+        self.assertEqual(b.snipe_plan["fire_at"], gtd["start"])
+        self.assertEqual(b.snipe_plan["phase_kind"], "signed")
+        self.assertEqual(b.snipe_plan["value"], 0)
+        self.assertEqual(len(b.snipe_plan["wallets"]), 2)
+
+    def test_a_wallet_that_is_not_on_the_phase_is_left_out(self):
+        b = node(make_bot())
+        gtd = self.stage()
+        later = self.stage(label="Public", kind="PUBLIC_SALE", start=gtd["start"] + 7200, price_wei=5 * 10**15, max=1)
+        b.phases_for = lambda chain, contract, accounts: [
+            {"account": accounts[0], "stage": gtd, "stages": [gtd]},
+            {"account": accounts[1], "stage": later, "stages": [later]},
+        ]
+        text = b.command_reply("/snipe", [CONTRACT])
+        self.assertEqual(b.snipe_plan["wallets"], [b.minters[0].address.lower()])
+        self.assertIn("Skipped", text)
+        self.assertIn("later", text)
+
+    def test_a_future_allowlist_is_what_mint_tells_you_to_schedule(self):
+        b = node(make_bot())
+        gtd = self.stage()
+        public_start = gtd["start"] + 7200
+        b.public_drop = lambda *a, **k: {
+            "price": 5 * 10**15,
+            "start": public_start,
+            "end": public_start + 3600,
+            "max": 1,
+            "recipient": "0x" + "12" * 20,
+        }
+        b.phases_for = lambda chain, contract, accounts: [{"account": a, "stage": gtd, "stages": [gtd]} for a in accounts]
+        text = b.command_reply("/mint", [CONTRACT])
+        self.assertIn("Godlist", text)
+        self.assertIn("/snipe", text)
+        self.assertNotIn("public mint", text.lower())
+        self.assertIsNone(b.snipe_plan)

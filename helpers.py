@@ -149,8 +149,8 @@ REVERT_NAMES = {
         "InvalidMerkleProof()", "NotAllowed()",
     ],
     "wrong payment amount": [
-        "InsufficientPayment()", "IncorrectPayment()", "WrongPrice()", "IncorrectPayment(uint256,uint256)",
-        "InsufficientFunds()", "InvalidPayment()", "WrongPayment()",
+        "InsufficientPayment()", "IncorrectPayment()", "IncorrectPayment(uint256,uint256)", "WrongPrice()",
+        "InsufficientFunds()", "InvalidPayment()", "InvalidPayment(uint256,uint256)", "WrongPayment()",
     ],
 }
 

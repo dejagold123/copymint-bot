@@ -37,6 +37,10 @@ class EmptyCallData(unittest.TestCase):
         b = make_bot()
         self.assertEqual(b.candidates(tx(to="0x" + "99" * 20), {COLLECTION: 1}), [])
 
+    def test_an_integer_tx_value_does_not_crash(self):
+        b = make_bot()
+        self.assertEqual(b.candidates(tx(value=10**16), {COLLECTION: 1}), [(COLLECTION, "0x", 10**16)])
+
     def test_a_free_empty_call_is_not(self):
         b = make_bot()
         self.assertEqual(b.candidates(tx(value="0x0"), {COLLECTION: 1}), [])
@@ -114,6 +118,63 @@ class SignedAndAllowlistCalls(unittest.TestCase):
         for other in chosen[1:]:
             self.assertIsNone(other)
         self.assertIn("not eligible", b.last_pick_reason)
+
+    def test_a_wallet_on_the_phase_is_not_failed_with_the_source_signature(self):
+        from eth_abi import encode
+        data = "0x12345678" + encode(["uint256", "bytes"], [1, b"\x01" * 64 + b"\x1b"]).hex()
+        values = {
+            "WATCH_ADDRESSES": WATCHED,
+            "MINTER_PRIVATE_KEYS": TEST_KEY + ",0x" + "22" * 32,
+            "CHAINS": "1",
+            "STATE_PATH": os.path.join(tempfile.mkdtemp(), "state.json"),
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            b = bot.Bot()
+        collection = "0x" + "ee" * 20
+        b.simulate = lambda *args, **kwargs: None
+        b._revert = {"message": "execution reverted", "data": ""}
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = RuntimeError("no such function")
+
+        def own(chain_id, acct, want):
+            if acct is b.minters[0]:
+                return ("mint", (0, bot.SEADROP, "0x4b61cd6f", 90_000))
+            return ("reason", "not on an allowlist for this drop")
+
+        b.own_phase_choice = own
+        first = b.pick(1, b.minters[0], [(collection, data, 0)], {collection: 1})
+        second = b.pick(1, b.minters[1], [(collection, data, 0)], {collection: 1})
+        self.assertEqual(first[1], bot.SEADROP)
+        self.assertIsNone(second)
+        self.assertIn("not on an allowlist", b.last_pick_reason)
+        self.assertNotIn("source wallet", b.last_pick_reason)
+
+    def test_one_minter_error_does_not_cancel_the_others(self):
+        values = {
+            "WATCH_ADDRESSES": WATCHED,
+            "MINTER_PRIVATE_KEYS": TEST_KEY + ",0x" + "22" * 32,
+            "CHAINS": "1",
+            "STATE_PATH": os.path.join(tempfile.mkdtemp(), "state.json"),
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            b = bot.Bot()
+        collection = "0x" + "ee" * 20
+
+        def pick(chain_id, acct, options, want):
+            if acct is b.minters[0]:
+                raise TypeError("bad log")
+            return (0, collection, "0x1234", 80_000)
+
+        b.pick = pick
+        b.fees = lambda chain_id: (1, 1)
+        b.ensure = lambda *args, **kwargs: True
+        b.land = lambda *args, **kwargs: ("0xabc", True, ["0xabc"])
+        b.rpc = mock.Mock()
+        b.rpc.call.return_value = "0x"
+        tx = {"hash": "0x" + "cd" * 32, "from": WATCHED, "to": collection, "value": "0x0", "input": "0x1234"}
+        with mock.patch.object(bot, "notify"), mock.patch.object(bot, "log"):
+            done = b.copy(1, tx, {collection: 1}, options=[(collection, "0x1234", 0)])
+        self.assertEqual(done, 1)
 
 
 class RealRevertReasons(unittest.TestCase):
