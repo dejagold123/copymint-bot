@@ -12,6 +12,7 @@ from decimal import Decimal
 from eth_utils import to_checksum_address
 
 from helpers import *  # noqa: F401,F403
+import opensea
 
 
 class SendMixin:
@@ -385,6 +386,17 @@ class SendMixin:
                 if token is None:
                     break
                 owned.add(token)
+        if len(owned) < balance and self.opensea and chain_id in opensea.CHAIN_TO_SLUG:
+            # The contract cannot list a wallet's tokens, so ask OpenSea, then confirm each ID on-chain.
+            try:
+                try:
+                    slug = self.collection_slug_for(chain_id, collection)
+                except Exception:
+                    slug = None
+                ids = self.opensea.account_nfts(opensea.CHAIN_TO_SLUG[chain_id], wallet, collection, slug)
+                owned.update(self.check_owned(chain_id, collection, wallet, [i for i in ids if i not in owned]))
+            except Exception as exc:
+                self.log(f"opensea holdings {type(exc).__name__}: {exc}")
         if len(owned) < balance and deep:
             supply = self.view_int(chain_id, collection, TOTAL_SUPPLY)
             if not supply:

@@ -69,3 +69,52 @@ class EasySendCommand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenSeaHoldings(unittest.TestCase):
+    def setup(self, listed):
+        b = node(make_bot())
+        me = b.minters[0].address.lower()
+        b.fake.enumerable = False
+        b.fake.owner = {(C721, i): me for i in (11, 12, 13, 14)}
+        b.fake.owner[(C721, 99)] = "0x" + "99" * 20
+        b.opensea = mock.Mock()
+        b.opensea.account_nfts.return_value = listed
+        b.collection_slug_for = lambda *a: "robo"
+        return b, me
+
+    def test_opensea_lists_tokens_the_contract_cannot(self):
+        b, me = self.setup([11, 12, 13, 14])
+        owned, missing, note = b.nfts_721(4663, C721, me, [], False)
+        self.assertEqual((owned, missing), ([11, 12, 13, 14], 0))
+        b.opensea.account_nfts.assert_called_once()
+
+    def test_stale_opensea_ids_are_checked_on_chain(self):
+        b, me = self.setup([11, 99, 12, 13, 14])
+        owned, missing, _note = b.nfts_721(4663, C721, me, [], False)
+        self.assertEqual(owned, [11, 12, 13, 14])
+
+    def test_an_opensea_failure_falls_back_to_the_old_notes(self):
+        b, me = self.setup([])
+        b.opensea.account_nfts.side_effect = RuntimeError("down")
+        owned, missing, note = b.nfts_721(4663, C721, me, [], False)
+        self.assertEqual((owned, missing), ([], 4))
+
+    def test_client_filters_by_contract_and_pages(self):
+        import opensea
+
+        c = opensea.OpenSea("k")
+        pages = [
+            {"nfts": [{"contract": C721, "identifier": "5"}, {"contract": "0x" + "ab" * 20, "identifier": "6"}], "next": "p2"},
+            {"nfts": [{"contract": C721.upper().replace("0X", "0x"), "identifier": "7"}], "next": None},
+        ]
+        seen = []
+
+        def request(method, path, params=None, body=None, timeout=20):
+            seen.append(params)
+            return pages[len(seen) - 1]
+
+        c.request = request
+        self.assertEqual(c.account_nfts("robinhood", "0xw", C721, "robo"), [5, 7])
+        self.assertEqual(seen[1]["next"], "p2")
+        self.assertEqual(seen[0]["collection"], "robo")

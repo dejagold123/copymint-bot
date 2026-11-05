@@ -366,6 +366,27 @@ class OpenSea:
                 break
         return found
 
+    def account_nfts(self, chain_slug, wallet, contract, collection=None, max_pages=25):
+        """Token IDs of one contract that OpenSea lists in a wallet. Verify ownership on-chain before trusting them."""
+        found, cursor = [], None
+        for _ in range(max_pages):
+            params = {"limit": 200}
+            if collection:
+                params["collection"] = collection
+            if cursor:
+                params["next"] = cursor
+            data = self.request("GET", f"/api/v2/chain/{chain_slug}/account/{wallet}/nfts", params=params)
+            for nft in (data.get("nfts") if isinstance(data, dict) else None) or []:
+                try:
+                    if str(nft.get("contract", "")).lower() == contract.lower():
+                        found.append(to_int(nft["identifier"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            cursor = data.get("next") if isinstance(data, dict) else None
+            if not cursor:
+                break
+        return found
+
     def best_offer(self, collection, token_id):
         """The highest active offer that could be accepted for one NFT, or None. Offers are paid in WETH-style tokens."""
         errors = []
