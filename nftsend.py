@@ -184,7 +184,8 @@ class SendMixin:
                             except Exception as exc:
                                 reason = decode_revert("", str(exc)) or "the contract refused the transfer"
                                 blocked.append((transfer, reason))
-            plan = {"dest": dest, "transfers": transfers, "created": time.time(), "state": "planned", "blocked": len(blocked), "cancel": threading.Event()}
+            shortfalls = self.gas_shortfalls(transfers)
+            plan = {"dest": dest, "transfers": transfers, "shortfalls": shortfalls, "created": time.time(), "state": "planned", "blocked": len(blocked), "cancel": threading.Event()}
             text = self.send_plan_text(plan, names, blocked, missing, skipped, deep)
             with self._send_lock:
                 if transfers and not (self.send_plan and self.send_plan["state"] == "running"):
@@ -193,6 +194,22 @@ class SendMixin:
         except Exception as exc:
             self.log(f"/sendnfts plan {type(exc).__name__}: {exc}")
             self.notify(f"⚠️ /sendnfts failed while looking for NFTs: {type(exc).__name__}")
+
+    def gas_shortfalls(self, transfers):
+        """(chain, wallet, balance, needed) for each wallet that cannot pay for its transfers."""
+        need = {}
+        for t in transfers:
+            need[(t["chain"], t["wallet"])] = need.get((t["chain"], t["wallet"]), 0) + t["gas"]
+        out = []
+        for (chain_id, wallet), gas in need.items():
+            try:
+                fee, _tip = self.fees(chain_id)
+                have = self.balance(chain_id, "native", to_checksum_address(wallet))
+            except Exception:
+                continue
+            if have < gas * fee:
+                out.append((chain_id, wallet, have, gas * fee))
+        return out
 
     def send_plan_text(self, plan, names, blocked, missing, skipped, deep):
         transfers = plan["transfers"]
@@ -215,6 +232,11 @@ class SendMixin:
             body = "\n".join(lines) + f"\nTotal: {total} NFT(s) in {len(transfers)} transfer(s)\n"
             if any(self.has_code(c, plan["dest"]) for c in {t["chain"] for t in transfers}):
                 body += "⚠️ The destination is a contract on one of these chains. Double-check that it can receive NFTs.\n"
+        for chain_id, wallet, have, need in plan.get("shortfalls", []):
+            body += (
+                f"⚠️ #{numbers.get(wallet, '?')} {short_address(wallet)} on {self.chains[chain_id].name} has {fmt_native(have, chain_id)} "
+                f"but needs about {fmt_native(need, chain_id)} for gas. Fund it first or these will fail.\n"
+            )
         if blocked:
             body += f"Cannot send {len(blocked)} NFT(s) (the contract refused the transfer): {blocked[0][1]}\n"
         if missing:

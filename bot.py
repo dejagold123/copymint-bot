@@ -2214,7 +2214,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         have = self.balance(chain_id, "native", acct.address)
         cost = value + gas * fee
         if have < cost:
-            raise RuntimeError(f"short {have} < {cost}")
+            raise RuntimeError(f"not enough gas: wallet has {fmt_native(have, chain_id)}, needs {fmt_native(cost, chain_id)}")
         if self.dry:
             log(f"DRY {acct.address[:8]} {self.chains[chain_id].name} value {value} gas {gas}")
             return "dry", True

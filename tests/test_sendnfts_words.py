@@ -118,3 +118,22 @@ class OpenSeaHoldings(unittest.TestCase):
         self.assertEqual(c.account_nfts("robinhood", "0xw", C721, "robo"), [5, 7])
         self.assertEqual(seen[1]["next"], "p2")
         self.assertEqual(seen[0]["collection"], "robo")
+
+
+class GasWarning(unittest.TestCase):
+    def test_plan_warns_when_wallet_cannot_pay_gas(self):
+        b = make_bot()
+        wallet = b.minters[0].address.lower()
+        transfers = [{"chain": 4663, "wallet": wallet, "collection": C721, "std": 721, "id": "1", "amount": 1, "gas": 100_000}]
+        with mock.patch.object(b, "fees", return_value=(10**9, 1)), mock.patch.object(b, "balance", return_value=5):
+            short = b.gas_shortfalls(transfers)
+        self.assertEqual(short, [(4663, wallet, 5, 100_000 * 10**9)])
+        plan = {"dest": DEST, "transfers": transfers, "shortfalls": short}
+        text = b.send_plan_text(plan, {}, [], [], [], False)
+        self.assertIn("for gas", text)
+        with mock.patch.object(b, "fees", return_value=(10**9, 1)), mock.patch.object(b, "balance", return_value=10**18):
+            self.assertEqual(b.gas_shortfalls(transfers), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
