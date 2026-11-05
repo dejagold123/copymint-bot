@@ -15,10 +15,58 @@ from helpers import *  # noqa: F401,F403
 
 
 class SendMixin:
+    def natural_send_args(self, args):
+        """Turn 'from wallet 2 to wallet 1 collection=0x…' into the options the command already understands.
+
+        'from' takes minter numbers, addresses or all; 'to' takes one minter number or one address. Filler words
+        (wallet, wallets, minter, send, nfts) are ignored. Returns (args, error). Plain old-style args pass through.
+        """
+        words = [a.lower() for a in args]
+        if "from" not in words and "to" not in words:
+            return args, None
+        filler = {"wallet", "wallets", "minter", "minters", "send", "nfts", "nft", "all", "everything"}
+        out, spec_from, spec_to = [], None, None
+        i = 0
+        while i < len(args):
+            word = words[i]
+            if word in ("from", "to"):
+                j, parts = i + 1, []
+                while j < len(args) and words[j] not in ("from", "to") and "=" not in args[j] and words[j] != "deep":
+                    parts.append(args[j])
+                    j += 1
+                kept = [p for p in parts if p.lower() not in filler or p.lower() == "all" and word == "from"]
+                text = "".join(kept) if word == "from" else (kept[0] if len(kept) == 1 else "".join(kept))
+                if word == "from":
+                    spec_from = text or "all"
+                else:
+                    spec_to = text
+                i = j
+                continue
+            if word not in filler:
+                out.append(args[i])
+            i += 1
+        if spec_from is not None and not any(a.lower().startswith(("wallets=", "wallet=", "w=")) for a in out):
+            out.append(f"wallets={spec_from}")
+        if spec_to is not None:
+            if not spec_to:
+                return None, "⚠️ Say where to send them: to wallet 1, or to 0xADDRESS."
+            if spec_to.isdigit():
+                number = int(spec_to)
+                if not 1 <= number <= len(self.minters):
+                    return None, f"⚠️ There is no minter number {number}. You have {len(self.minters)}. Send /minters to see them."
+                out.append(self.minters[number - 1].address.lower())
+            elif valid_address(spec_to):
+                out.append(valid_address(spec_to))
+            else:
+                return None, f"⚠️ I could not read \"{spec_to}\" as a destination. Use a minter number like 1, or an address."
+        return out, None
+
     def sendnfts_command(self, args):
         args = list(args)
         usage = (
-            "✏️ Usage: /sendnfts 0xDESTINATION [wallets=1,3] [chain=robinhood] [collection=0xabc…] [deep]\n"
+            "✏️ Usage, easy form: /sendnfts from wallet 2 to wallet 1 collection=0xabc…\n"
+            "(from takes minter numbers like 1,3 or all, to takes one minter number or an 0x address; numbers are as /minters lists them.)\n"
+            "Full form: /sendnfts 0xDESTINATION [wallets=1,3] [chain=robinhood] [collection=0xabc…] [deep]\n"
             "Sends every NFT the chosen minters hold (default: all minters, all enabled chains) to the destination.\n"
             "I list what I found and what it will cost, then you send /sendnfts confirm within 2 minutes, or /sendnfts cancel.\n"
             "I know the NFTs your minters minted through this bot since this feature was added. For older NFTs add collection=0xabc… "
@@ -55,6 +103,9 @@ class SendMixin:
         with self._send_lock:
             if self.send_plan and self.send_plan["state"] in ("running", "stopping"):
                 return "A send is already running or stopping. Send /sendnfts cancel to stop it."
+        args, natural_error = self.natural_send_args(args)
+        if natural_error:
+            return natural_error
         deep = False
         for token in list(args):
             if token.lower() == "deep":
