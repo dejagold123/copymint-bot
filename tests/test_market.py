@@ -221,6 +221,7 @@ class ListCommandTests(unittest.TestCase):
         b = make_market(**env)
         patch_chain(b)
         b.detect_standard = lambda *a: 721
+        b.settings["confirm_trades"] = True
         return b
 
     def test_usage_and_key(self):

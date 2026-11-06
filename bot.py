@@ -29,6 +29,7 @@ from eth_utils import keccak, to_checksum_address
 import opensea
 import phases
 from helpers import *  # noqa: F401,F403
+from easy import EasyMixin
 from nftsend import SendMixin
 from market import MarketMixin
 from settings import SPEC as SETTING_SPEC, SettingsMixin
@@ -521,7 +522,7 @@ def rewrite(data, old, new):
     return "0x" + data[2:].lower().replace(word(old), word(new))
 
 
-class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
+class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
     def log(self, *args, **kwargs):
         return log(*args, **kwargs)
 
@@ -1667,6 +1668,9 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
             return f"✅ Armed. It will fire in {int(plan['fire_at'] - time.time())}s. Send /snipe cancel to stop it."
         if self.snipe_plan and self.snipe_plan["state"] == "armed":
             return "A snipe is already armed. Send /snipe cancel first."
+        args, _delay, _when, easy_error = self.easy_args(args, "snipe")
+        if easy_error:
+            return easy_error
         override = None
         wallet_spec = None
         for token in list(args):
@@ -1794,7 +1798,11 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin):
         plan["when"] = when
         with self._snipe_lock:
             self.snipe_plan = plan
-        return self.snipe_plan_text(plan)
+        text = self.snipe_plan_text(plan)
+        if self.setting("confirm_trades"):
+            return text
+        text = text.replace("\nSend /snipe confirm to arm it, or /snipe cancel.", "")
+        return text + "\n\n" + self.snipe_command(["confirm"])
 
     def snipe_wait(self, moment):
         """Sleep until the moment. Returns False if the snipe was cancelled first."""

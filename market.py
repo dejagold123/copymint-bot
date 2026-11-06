@@ -297,6 +297,9 @@ class MarketMixin:
             return missing
         if self.market_busy():
             return "Another sell or offer job is running. Wait for it or send /list cancel."
+        args, _delay, _when, error = self.easy_args(args, "list")
+        if error:
+            return error
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         days_spec = self.pull_option(args, ("days=",))
         try:
@@ -355,7 +358,7 @@ class MarketMixin:
         }
         if not self.market_set("list", plan):
             return "Another sell or offer job is running."
-        return (
+        text = (
             f"🏷 List on {self.chains[chain_id].name}\n"
             f"NFT: {name or 'token'} #{nft['token']}\nCA: {nft['contract']}\n"
             f"Price: {fmt_native(price_wei, chain_id)}   You receive about {fmt_native(net, chain_id)} after fees\n"
@@ -363,8 +366,11 @@ class MarketMixin:
             + ("Priced as a multiple of the top offer, so auto-listing may raise it later.\n" if kind == "multiple" else "")
             + ("🧪 Dry run is on: nothing will be sent.\n" if self.dry else "")
             + "\nThe first listing from a wallet for a collection also sends one approval transaction (gas)."
-            + "\nSend /list confirm within 2 minutes, or /list cancel."
         )
+        warning, nobody = self.funds_note(chain_id, [nft["acct"].address.lower()], self.gas_margin(chain_id, 150_000), "gas")
+        if warning:
+            text += "\n" + warning
+        return self.finish_plan("list", text, lambda: self.list_command(["confirm"]), "the wallet has no coin for gas." if nobody else "")
 
     def run_list(self, plan):
         lines = []
@@ -427,7 +433,7 @@ class MarketMixin:
         plan = {"targets": targets, "cancel": threading.Event()}
         if not self.market_set("unlist", plan):
             return "Another sell or offer job is running."
-        return f"🗑 Cancel {len(targets)} listing(s)? Each sends a cancel transaction.\nSend /unlist confirm within 2 minutes, or /unlist cancel."
+        return self.finish_plan("unlist", f"🗑 Cancel {len(targets)} listing(s). Each sends a cancel transaction.", lambda: self.unlist_command(["confirm"]), bulk=True)
 
     def run_unlist(self, plan):
         lines = []
@@ -473,6 +479,9 @@ class MarketMixin:
             return missing
         if self.market_busy():
             return "Another sell or offer job is running."
+        args, _delay, _when, error = self.easy_args(args, "sellall")
+        if error:
+            return error
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         chain_word = self.pull_option(args, ("chain=", "c="))
         collection_word = self.pull_option(args, ("collection=",))
@@ -548,8 +557,7 @@ class MarketMixin:
         if self.dry:
             lines.append("🧪 Dry run is on: nothing will be sent.")
         lines.append("Each wallet's first listing in a collection also sends one approval transaction (gas).")
-        lines.append("Send /sellall confirm within 2 minutes, or /sellall cancel.")
-        return "\n".join(lines)
+        return self.finish_plan("sellall", "\n".join(lines), lambda: self.sellall_command(["confirm"]), bulk=True)
 
     def run_sellall(self, plan):
         lines = []
@@ -604,6 +612,9 @@ class MarketMixin:
             return missing
         if self.market_busy():
             return "Another sell or offer job is running."
+        args, _delay, _when, error = self.easy_args(args, "offer")
+        if error:
+            return error
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         hours_spec = self.pull_option(args, ("hours=",))
         try:
@@ -657,15 +668,24 @@ class MarketMixin:
         if not self.market_set("offer", plan):
             return "Another sell or offer job is running."
         held = self.view_int(chain_id, weth, BALANCE_OF_ERC20 + addr_word(acct.address))
-        return (
+        text = (
             f"🤝 Offer on {self.chains[chain_id].name}\n"
             f"NFT: {name or 'token'} #{token_id}\nCA: {contract}\n"
             f"Offer: {fmt_native(price_wei, chain_id)} (wrapped)   Lasts {hours}h\n"
             f"Top offer now: {fmt_native(top['price_wei'], chain_id) if top else 'none'}\n"
             f"From: 👛 {self.minters.index(acct) + 1}. {short_address(acct.address)} holds {fmt_native(held, chain_id) if held is not None else 'unknown'} wrapped\n"
             + ("🧪 Dry run is on: nothing will be sent.\n" if self.dry else "")
-            + "\nSend /offer confirm within 2 minutes, or /offer cancel."
         )
+        problems = []
+        if held is not None and held < price_wei:
+            text += f"\n⚠️ The wallet holds {fmt_native(held, chain_id)} wrapped, less than the offer. Wrap some coin first."
+            problems.append("the wallet does not hold enough wrapped coin for this offer.")
+        warning, nobody = self.funds_note(chain_id, [acct.address.lower()], self.gas_margin(chain_id, 100_000), "gas")
+        if warning:
+            text += "\n" + warning
+            if nobody:
+                problems.append("the wallet has no coin for gas.")
+        return self.finish_plan("offer", text, lambda: self.offer_command(["confirm"]), " ".join(problems))
 
     def run_offer(self, plan):
         chain_id = plan["chain"]

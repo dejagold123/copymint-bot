@@ -37,7 +37,7 @@ class TradeMixin:
     def buy_command(self, args):
         args = list(args)
         usage = (
-            "✏️ Usage: /buy OPENSEA_ITEM_LINK [wallets=1,3] [max=0.01]\n"
+            "✏️ Usage: /buy OPENSEA_ITEM_LINK [wallets=1,3] [max=0.01]\nOr in words: /buy 0xCONTRACT 123 under 0.01 wallet 2 at 5pm UTC\n"
             "Buys that one NFT at its current lowest listing price, in the chain's own coin.\n"
             "wallets=1,3 picks the buyers (numbers as /minters lists them). With several wallets, I try them in order and stop at the first that buys.\n"
             f"max= sets the highest price I will pay. It can only go below the limit of {fmt_native(self.max_buy, 4663)} (MAX_BUY_ETH in Railway).\n"
@@ -79,6 +79,9 @@ class TradeMixin:
         with self._buy_lock:
             if self.buy_plan and self.buy_plan["state"] in ("running", "stopping"):
                 return "A purchase is already running or stopping. Send /buy cancel to stop it."
+        args, delay, when, error = self.easy_args(args, "buy")
+        if error:
+            return error
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         max_spec = self.pull_option(args, ("max=", "limit="))
         accounts, error = self.choose_minters(wallet_spec)
@@ -129,10 +132,15 @@ class TradeMixin:
             "max": max_wei,
             "wallets": [a.address.lower() for a in accounts],
             "cancel": threading.Event(),
+            "start_at": time.time() + delay if delay else None,
+            "when": when,
         }
         with self._buy_lock:
             self.buy_plan = plan
-        return self.buy_plan_text(plan) + "\n\nSend /buy confirm within 2 minutes to buy, or /buy cancel."
+        warning, nobody = self.funds_note(chain_id, plan["wallets"], listing["price_wei"] + self.gas_margin(chain_id), "the price plus gas")
+        text = self.buy_plan_text(plan) + (("\n" + warning) if warning else "")
+        problem = "none of the chosen wallets has enough to pay for it." if nobody else ""
+        return self.finish_plan("buy", text, lambda: self.buy_command(["confirm"]), problem)
 
     def buy_plan_text(self, plan):
         chain_id = plan["chain"]
@@ -141,6 +149,7 @@ class TradeMixin:
             f"NFT: {plan['name'] or 'token ' + str(plan['token'])} (#{plan['token']})",
             f"CA: {plan['contract']}",
             f"Price: {fmt_native(plan['listing']['price_wei'], chain_id)}   (highest I will pay: {fmt_native(plan['max'], chain_id)})",
+            *([f"Starts: {plan['when']} (in {fmt_duration(plan['start_at'] - time.time())})"] if plan.get("start_at") else []),
             "Buyers, in order:",
         ]
         for number, acct in enumerate(self.minters, 1):
@@ -211,6 +220,19 @@ class TradeMixin:
         chain_id = plan["chain"]
         lines, done, waiting = [], False, False
         try:
+            if plan.get("start_at"):
+                plan["cancel"].wait(max(0, plan["start_at"] - time.time()))
+                if not plan["cancel"].is_set():
+                    try:
+                        fresh = self.opensea.best_listing(plan["slug"], plan["collection"], plan["contract"], plan["token"])
+                    except opensea.OpenSeaError as exc:
+                        fresh = None
+                        lines.append(f"❌ OpenSea said no at start time: {esc(str(exc)[:100])}")
+                    if fresh and fresh["native"] is not False and fresh["quantity"] == 1:
+                        plan["listing"] = fresh
+                    else:
+                        plan["cancel"].set()
+                        lines.append("❌ Nothing to buy at start time (no single-item native-coin listing).")
             for acct in self.minters:
                 if acct.address.lower() not in plan["wallets"]:
                     continue
@@ -254,7 +276,7 @@ class TradeMixin:
     def sweep_command(self, args):
         args = list(args)
         usage = (
-            "✏️ Usage: /sweep OPENSEA_COLLECTION_LINK max=0.002 [budget=0.5] [wallets=1,3] [chain=robinhood]\n"
+            "✏️ Usage: /sweep OPENSEA_COLLECTION_LINK max=0.002 [budget=0.5] [wallets=1,3] [chain=robinhood]\nOr in words: /sweep 0xCONTRACT under 0.002 budget 0.5 wallet 1 on robinhood at 5pm UTC\n"
             "Watches that collection and buys every listing at or below max= (a price per NFT, in the chain's coin), cheapest first, until you stop it.\n"
             "budget= is the most I may spend in total. When the next buy would pass it, I stop. Without it I run until /sweep stop.\n"
             "wallets=1,3 picks the buyers (numbers as /minters lists them). I rotate through them and skip a wallet that cannot pay.\n"
@@ -303,6 +325,9 @@ class TradeMixin:
         with self._sweep_lock:
             if self.sweep_plan and self.sweep_plan["state"] == "running":
                 return "A sweep is already running. Send /sweep stop first."
+        args, delay, when, error = self.easy_args(args, "sweep")
+        if error:
+            return error
         wallet_spec = self.pull_option(args, ("wallets=", "wallet=", "w="))
         chain_word = self.pull_option(args, ("chain=", "c="))
         max_spec = self.pull_option(args, ("max=", "price=", "limit="))
@@ -394,11 +419,16 @@ class TradeMixin:
             "tried": 0,
             "error": "",
             "started": None,
+            "start_at": time.time() + delay if delay else None,
+            "when": when,
         }
         with self._sweep_lock:
             self.sweep_plan = plan
         now = f"Right now {len(affordable)} of the {len(rows)} cheapest listings are at or below your price." if rows else "I see no listings right now."
-        return self.sweep_plan_text(plan) + f"\n{now}\n\nSend /sweep confirm within 2 minutes to start, or /sweep stop."
+        warning, nobody = self.funds_note(chain_id, plan["wallets"], max_wei + self.gas_margin(chain_id), "one NFT at your max plus gas")
+        text = self.sweep_plan_text(plan) + f"\n{now}" + (("\n" + warning) if warning else "")
+        problem = "none of the chosen wallets can pay even one NFT at your max." if nobody else ""
+        return self.finish_plan("sweep", text, lambda: self.sweep_command(["confirm"]), problem)
 
     def sweep_plan_text(self, plan):
         chain_id = plan["chain"]
@@ -406,6 +436,7 @@ class TradeMixin:
         lines = [
             f"🧹 Sweep on {self.chains[chain_id].name}",
             f"Collection: {plan['collection']}",
+            *([f"Starts: {plan['when']} (in {fmt_duration(plan['start_at'] - time.time())})"] if plan.get("start_at") else []),
             f"Buys at or below: {fmt_native(plan['max'], chain_id)} each",
             f"Total budget: {budget}",
             *([f"Only with: {', '.join(f'{k} = {v}' for k, v in plan['traits'].items())}"] if plan["traits"] else []),
@@ -476,6 +507,9 @@ class TradeMixin:
         failures = 0
         reason = "stopped by you"
         try:
+            if plan.get("start_at"):
+                self.sweep_stop.wait(max(0, plan["start_at"] - time.time()))
+                plan["started"] = time.time()
             while not self.sweep_stop.is_set():
                 try:
                     rows = self.opensea.collection_listings(plan["collection"], limit=50)

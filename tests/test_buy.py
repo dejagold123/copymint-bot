@@ -29,7 +29,9 @@ def make_bot(**env):
     }
     values.update(env)
     with mock.patch.dict(os.environ, values, clear=True):
-        return bot.Bot()
+        made = bot.Bot()
+    made.settings.update({"confirm_trades": True, "confirm_bulk": True})
+    return made
 
 
 def listing(price=10**15, native=True, quantity=1):

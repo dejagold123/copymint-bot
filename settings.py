@@ -19,6 +19,8 @@ SPEC = {
     "autolist_seconds": ("int", 60, 15, 3600, "How often listings are checked, in seconds"),
     "premint_min_sales": ("int", 0, 0, 100000, "Skip copying a collection OpenSea knows that has fewer sales than this (0 = off; new collections always pass)"),
     "opensea_names": ("bool", True, None, None, "Use OpenSea collection names in alerts when the contract has none"),
+    "confirm_trades": ("bool", False, None, None, "Ask for /confirm before /buy, /sweep, /list and /offer (off = they start at once, like /mint)"),
+    "confirm_bulk": ("bool", True, None, None, "Ask for /confirm before /sellall, /unlist and /sendnfts (these move or sell many NFTs)"),
     "stream": ("bool", True, None, None, "Use OpenSea's live feed to wake /sweep the moment a listing appears"),
 }
 

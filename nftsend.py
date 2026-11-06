@@ -191,6 +191,8 @@ class SendMixin:
                 if transfers and not (self.send_plan and self.send_plan["state"] == "running"):
                     self.send_plan = plan
             self.notify(text)
+            if transfers and not self.setting("confirm_bulk") and not shortfalls:
+                self.notify(self.sendnfts_command(["confirm"]))
         except Exception as exc:
             self.log(f"/sendnfts plan {type(exc).__name__}: {exc}")
             self.notify(f"⚠️ /sendnfts failed while looking for NFTs: {type(exc).__name__}")
@@ -255,7 +257,8 @@ class SendMixin:
             body += "Skipped (already the destination): " + ", ".join(short_address(a) for a in skipped) + "\n"
         if self.dry:
             body += "Dry run is on: nothing will be sent\n"
-        tail = f"\nSend /sendnfts confirm within {SEND_PLAN_SECONDS // 60} minutes to send, or /sendnfts cancel." if transfers else ""
+        auto = not self.setting("confirm_bulk") and not plan.get("shortfalls")
+        tail = f"\nSend /sendnfts confirm within {SEND_PLAN_SECONDS // 60} minutes to send, or /sendnfts cancel." if transfers and not auto else ""
         return head + body + tail
 
     def send_worker(self, plan, chain_id, acct, items, results):
