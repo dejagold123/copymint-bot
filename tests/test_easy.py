@@ -128,3 +128,12 @@ class StartAtOnce(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BridgePathRegression(unittest.TestCase):
+    def test_a_wallet_short_of_gas_reaches_the_bridge_check_without_crashing(self):
+        # `self.holdings` is the dict of minted NFTs; the bridge's balance reader must not share that name.
+        b = maker()
+        self.assertIsInstance(b.holdings, dict)
+        with mock.patch.object(b, "balance", return_value=0), mock.patch.object(b, "token_balances", return_value=[]):
+            self.assertFalse(b.ensure(b.minters[0], 4663, 10**18))

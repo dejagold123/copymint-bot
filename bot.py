@@ -14,6 +14,7 @@ import json
 import os
 import re
 import threading
+import traceback
 import time
 import urllib.error
 import urllib.parse
@@ -1994,8 +1995,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             tx = {"hash": f"snipe-{int(plan['fire_at'])}", "from": "manual", "to": contract}
             self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report, "total": len(chosen)}, kind="snipe")
         except Exception as exc:
-            log(f"snipe {type(exc).__name__}: {exc}")
-            notify(f"⚠️ Snipe failed: {type(exc).__name__}")
+            log(f"snipe {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            notify(f"⚠️ Snipe failed: {type(exc).__name__}: {str(exc)[:120]}")
         finally:
             if not immediate:
                 with self._snipe_lock:
@@ -2376,7 +2377,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
         log(f"bridge {'OK' if ok else 'FAIL'} {txh}")
         return ok
 
-    def holdings(self, holder):
+    def token_balances(self, holder):
         """Every non-zero native and stablecoin balance a wallet has, read in parallel."""
         jobs = []
         for src in self.chains:
@@ -2411,7 +2412,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
         if self.funder and self.funder.address.lower() != minter.address.lower():
             holders.append(self.funder)
         for holder in holders:
-            for src, token, decimals, have in self.holdings(holder):
+            for src, token, decimals, have in self.token_balances(holder):
                 if src == chain_id and token == "native":
                     continue
                 quote = self.sized_quote(src, chain_id, token, decimals, have, holder.address, minter.address, short)
