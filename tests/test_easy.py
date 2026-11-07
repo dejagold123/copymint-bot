@@ -137,3 +137,20 @@ class BridgePathRegression(unittest.TestCase):
         self.assertIsInstance(b.holdings, dict)
         with mock.patch.object(b, "balance", return_value=0), mock.patch.object(b, "token_balances", return_value=[]):
             self.assertFalse(b.ensure(b.minters[0], 4663, 10**18))
+
+
+class HistoryLog(unittest.TestCase):
+    def test_history_lists_upcoming_and_past_and_survives_a_restart(self):
+        b = maker()
+        self.assertIn("Nothing is scheduled", b.history_command([]))
+        b.hist_add("snipe", "armed", 4663, NFT, "FCFS ×1")
+        b.hist_add("snipe", "done", 4663, NFT, "1 of 4 minted")
+        text = b.history_command([])
+        self.assertLess(text.index("done"), text.index("armed"))  # newest first
+        self.assertIn("1 of 4 minted", text)
+        b.snipe_plan = {"state": "armed", "chain": 4663, "contract": NFT, "signature": "FCFS", "qty": 1, "fire_at": time.time() + 600}
+        self.assertIn("Armed snipe", b.history_command([]))
+        self.assertIn("History", b.command_reply("/history", []))
+        with mock.patch.dict(os.environ, {"WATCH_ADDRESSES": "0x" + "ab" * 20, "MINTER_PRIVATE_KEYS": "0x" + "11" * 32, "CHAINS": "4663", "STATE_PATH": str(b.state_path)}, clear=True):
+            again = bot.Bot()
+        self.assertEqual(len(again.history), 2)

@@ -31,6 +31,7 @@ import opensea
 import phases
 from helpers import *  # noqa: F401,F403
 from easy import EasyMixin
+from history import HistoryMixin
 from nftsend import SendMixin
 from market import MarketMixin
 from settings import SPEC as SETTING_SPEC, SettingsMixin
@@ -223,6 +224,7 @@ def collections_html(want):
 
 
 MENU = (
+    ("history", "🗓 What is scheduled and what happened"),
     ("status", "📡 Copying, dry run, and wallets"),
     ("off", "⏸ Pause copying"),
     ("on", "▶️ Resume copying"),
@@ -523,7 +525,7 @@ def rewrite(data, old, new):
     return "0x" + data[2:].lower().replace(word(old), word(new))
 
 
-class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
+class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryMixin):
     def log(self, *args, **kwargs):
         return log(*args, **kwargs)
 
@@ -610,6 +612,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
         self.settings = {}
         self.autolist = {}
         self.ledger = []
+        self.history = []
         self._block_fails = {}
         self.refetch = {}
         self.send_plan = None
@@ -695,6 +698,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             self.settings = {k: v for k, v in (data.get("settings") or {}).items() if k in SETTING_SPEC}
             self.autolist = {str(k): v for k, v in (data.get("autolist") or {}).items() if isinstance(v, dict)}
             self.ledger = [e for e in (data.get("ledger") or []) if isinstance(e, dict)]
+            self.history = [e for e in (data.get("history") or []) if isinstance(e, dict) and "t" in e][-300:]
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
             if isinstance(saved_watch, list) and saved_watch:
@@ -746,6 +750,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
                 state["autolist"] = dict(self.autolist)
             if getattr(self, "ledger", None):
                 state["ledger"] = list(self.ledger[-3000:])
+            if getattr(self, "history", None):
+                state["history"] = list(self.history[-300:])
             if self.watch_saved:
                 state["watch"] = sorted(self.watch)
             if self.cap_overrides:
@@ -1265,6 +1271,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
         job = (chain_id, contract, qty, price_wei)
         if len(accounts) != len(self.minters):
             job += ([a.address for a in accounts],)
+        self.hist_add("mint", "started", chain_id, contract, f"×{qty}")
         threading.Thread(target=self.run_manual_mint, args=job, daemon=True).start()
         mode = " (dry run, nothing will be sent)" if self.dry else ""
         who = f"{len(self.minters)} minter(s)" if len(accounts) == len(self.minters) else "minter " + ", ".join(
@@ -1392,6 +1399,27 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             return None
         return (signature, layout)
 
+    def eligibility_lines(self, rows, using, stage):
+        """One line per wallet saying what OpenSea reported for it, so the plan shows who is eligible and who is not."""
+        numbers = {a.address.lower(): i + 1 for i, a in enumerate(self.minters)}
+        lines = []
+        for row in rows:
+            acct = row["account"]
+            who = f"#{numbers.get(acct.address.lower(), '?')} {short_address(acct.address)}"
+            if acct in using:
+                cap = row["stage"].get("max")
+                minted = int(row["stage"].get("minted") or 0)
+                limit = f", {minted} of {cap} minted" if cap is not None else ""
+                lines.append(f"✅ {who}: eligible for {row['stage']['label']}{limit}")
+            elif not row.get("stages"):
+                lines.append(f"❔ {who}: OpenSea could not say, so it is left out")
+            elif not row.get("stage"):
+                lines.append(f"⛔ {who}: not eligible (or already at its limit)")
+            else:
+                when = time.strftime("%H:%M UTC", time.gmtime(row["stage"]["start"]))
+                lines.append(f"⏭ {who}: on {row['stage']['label']} at {when}, which is later")
+        return lines
+
     def _plan_from_phases(self, chain_id, contract, qty, price_wei, delay, accounts, drop_time):
         """A plan for the allowlist these wallets are on, or None to keep the public-sale plan."""
         try:
@@ -1421,7 +1449,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             other = row.get("stage")
             who = f"#{numbers.get(row['account'].address.lower(), '?')}"
             if not other:
-                skipped.append(f"{who} is not eligible")
+                skipped.append(f"{who} is not eligible" if row.get("stages") else f"{who} could not be checked")
             else:
                 when = time.strftime("%H:%M UTC", time.gmtime(other["start"]))
                 skipped.append(f"{who} is on {other['label']} at {when}, which is later")
@@ -1482,6 +1510,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             "drop_end": stage["end"],
             "phase_kind": "signed",
             "stage": stage,
+            "eligibility": self.eligibility_lines(rows, using, stage),
         }
         return plan, None
 
@@ -1623,7 +1652,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             + (f"Other mint functions found: {', '.join(plan['others'])}. Add fn=NAME(types) to the command to pick another.\n" if plan.get("others") else "")
             + (f"{plan['note']}\n" if plan.get("note") else "")
             + f"Minters: {self.plan_wallets_text(plan)}\n"
-            f"Starts in: {fmt_duration(seconds)}" + (f" (at {plan['when']})" if plan.get("when") else "") + "\n"
+            + ("".join(line + "\n" for line in plan.get("eligibility") or []))
+            + f"Starts in: {fmt_duration(seconds)}" + (f" (at {plan['when']})" if plan.get("when") else "") + "\n"
             f"Nothing is broadcast while the contract reverts the mint. "
             f"Once it accepts the call, a reverted transaction is retried every {self.snipe_retry:g}s until the window ends.\n"
             f"{gas_line}\n"
@@ -1653,6 +1683,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
                 plan, self.snipe_plan = self.snipe_plan, None
             if not plan:
                 return "Nothing is scheduled."
+            self.hist_add("snipe", "cancelled", plan["chain"], plan["contract"])
             self.snipe_cancel.set()
             return "🛑 Snipe cancelled."
         if word == "confirm":
@@ -1666,6 +1697,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
                 plan["state"] = "armed"
                 self.snipe_cancel.clear()
             threading.Thread(target=self.run_snipe, args=(plan,), daemon=True).start()
+            self.hist_add("snipe", "armed", plan["chain"], plan["contract"], f"{plan['signature']} ×{plan['qty']}, wallets {self.plan_wallets_text(plan)}, fires {time.strftime('%H:%M UTC', time.gmtime(plan['fire_at']))}")
             return f"✅ Armed. It will fire in {int(plan['fire_at'] - time.time())}s. Send /snipe cancel to stop it."
         if self.snipe_plan and self.snipe_plan["state"] == "armed":
             return "A snipe is already armed. Send /snipe cancel first."
@@ -1993,9 +2025,15 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
                     for job in jobs:
                         job.result()
             tx = {"hash": f"snipe-{int(plan['fire_at'])}", "from": "manual", "to": contract}
+            won = sum(1 for r in report.values() if r.get("status") == "minted")
+            dry = sum(1 for r in report.values() if r.get("status") == "dry")
+            event = "dry" if dry and not won else ("done" if won else "failed")
+            why = next((r.get("reason") for r in report.values() if r.get("reason")), "")
+            self.hist_add("snipe", event, chain_id, contract, f"{won} of {len(chosen)} minted" + (f" ({why})" if why and not won else ""))
             self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report, "total": len(chosen)}, kind="snipe")
         except Exception as exc:
             log(f"snipe {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            self.hist_add("snipe", "failed", chain_id, contract, f"{type(exc).__name__}: {str(exc)[:100]}")
             notify(f"⚠️ Snipe failed: {type(exc).__name__}: {str(exc)[:120]}")
         finally:
             if not immediate:
@@ -2133,6 +2171,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin):
             return self.offer_command(args)
         if command == "/pnl":
             return self.pnl_command(args)
+        if command in ("/history", "/log"):
+            return self.history_command(args)
         if command in ("/help", "/start"):
             lines = ["Tap / to open the menu.\n"]
             lines.extend(f"/{name}  {text}" for name, text in MENU)

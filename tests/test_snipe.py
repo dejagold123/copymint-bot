@@ -706,3 +706,27 @@ class AllowlistPhase(unittest.TestCase):
         self.assertIn("/snipe", text)
         self.assertNotIn("public mint", text.lower())
         self.assertIsNone(b.snipe_plan)
+
+
+class EligibilityLines(unittest.TestCase):
+    def test_the_plan_names_who_is_eligible_and_who_is_not(self):
+        b = node(make_bot())
+        start = bot.time.time() + 3600
+        fcfs = {"label": "FCFS", "kind": "SIGNED_PUBLIC", "start": start, "end": start + 3600, "eligible": True, "max": 1, "price_wei": 0, "minted": 0}
+        closed = dict(fcfs, eligible=False)
+        b.public_drop = lambda *a, **k: None
+        a1, a2 = b.minters[0], b.minters[1]
+
+        def rows(chain, contract, accounts):
+            return [
+                {"account": a1, "stage": fcfs, "stages": [fcfs]},
+                {"account": a2, "stage": None, "stages": [closed]},
+            ] + [{"account": a, "stage": None, "stages": []} for a in accounts[2:]]
+
+        b.phases_for = rows
+        text = b.command_reply("/snipe", [CONTRACT])
+        self.assertIn("✅", text)
+        self.assertIn("eligible for FCFS, 0 of 1 minted", text)
+        self.assertIn("⛔", text)
+        self.assertIn("not eligible", text)
+        self.assertEqual(b.snipe_plan["wallets"], [a1.address.lower()])

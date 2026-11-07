@@ -259,6 +259,7 @@ class TradeMixin:
                 title = "Sent, waiting for confirmation"
             else:
                 title = "Bought" if done and not self.dry else ("Would buy (dry run)" if done else "Not bought")
+            self.hist_add("buy", "done" if done else ("partial" if waiting else "failed"), chain_id, plan["contract"], f"#{plan['token']} {title.lower()}")
             self.alert(
                 f"{title}: {plan['contract']} #{plan['token']}",
                 card(
