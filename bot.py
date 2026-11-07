@@ -3129,7 +3129,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             self.send_summary(chain_id, tx, want, item, gave_up=True, note=f"gave up after {item['attempts']} attempts")
             self.seen.add(key)
             self.pending.pop(key, None)
-        elif self.paused:
+        elif self.paused and not str(tx.get("hash", "")).startswith("manual-"):
             # /off was sent while this copy ran. Paused mints are not replayed.
             self.seen.add(key)
             self.pending.pop(key, None)
@@ -3509,9 +3509,9 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                     self.handle_tx(held["chain"], held["txh"], held["logs"])
                 except Exception as exc:
                     log(f"refetch {held['txh']} {exc}")
-        if self.paused:
-            return
         for key, item in list(self.pending.items()):
+            if self.paused and not str(item.get("hash", "")).startswith("manual-"):
+                continue  # /off stops copy retries; a /mint you typed still finishes
             if time.time() < float(item.get("next_try") or 0):
                 continue
             chain_id = int(item["chain"])

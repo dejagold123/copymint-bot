@@ -154,3 +154,18 @@ class HistoryLog(unittest.TestCase):
         with mock.patch.dict(os.environ, {"WATCH_ADDRESSES": "0x" + "ab" * 20, "MINTER_PRIVATE_KEYS": "0x" + "11" * 32, "CHAINS": "4663", "STATE_PATH": str(b.state_path)}, clear=True):
             again = bot.Bot()
         self.assertEqual(len(again.history), 2)
+
+
+class PausedCopying(unittest.TestCase):
+    def test_off_does_not_drop_a_manual_mint_retry(self):
+        b = maker()
+        b.paused = True
+        calls = []
+        b.pending = {
+            "manual-1": {"chain": 4663, "hash": "manual-1", "from": "manual", "to": NFT, "input": "0x", "value": 0, "want": {NFT: 1}, "next_try": 0},
+            "0xcopied": {"chain": 4663, "hash": "0xcopied", "from": "0x1", "to": NFT, "input": "0x", "value": 0, "want": {NFT: 1}, "next_try": 0},
+        }
+        with mock.patch.object(b, "copy", side_effect=lambda chain, tx, want, **k: calls.append(tx["hash"])):
+            b.retry_pending()
+        self.assertIn("manual-1", calls)
+        self.assertNotIn("0xcopied", calls)
