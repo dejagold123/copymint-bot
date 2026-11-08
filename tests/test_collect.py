@@ -106,3 +106,30 @@ class Collect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnKey(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("COLLECT_TO", "COLLECT_WALLET", "COLLECT_PRIVATE_KEY")])
+
+    def test_its_own_key_is_used_and_is_not_a_minter(self):
+        b = collector({"v": ETH})
+        os.environ["COLLECT_TO"] = DEST
+        os.environ["COLLECT_PRIVATE_KEY"] = "33" * 32  # no 0x prefix is fine
+        acct = b.collect_wallet()
+        self.assertIsNotNone(acct)
+        self.assertNotIn(acct, b.minters)
+        self.assertEqual(b.collect_problem(), "")
+        text = b.collect_command(["on"])
+        self.assertIn("is on", text)
+        status = b.collect_command([])
+        self.assertIn(acct.address, status)
+        self.assertNotIn("33" * 32, status)
+
+    def test_a_bad_key_is_reported_without_printing_it(self):
+        b = collector({"v": ETH})
+        os.environ["COLLECT_TO"] = DEST
+        os.environ["COLLECT_PRIVATE_KEY"] = "not-a-key"
+        problem = b.collect_problem()
+        self.assertIn("not a valid private key", problem)
+        self.assertNotIn("not-a-key", problem)

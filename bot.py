@@ -616,6 +616,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         self.ledger = []
         self.history = []
         self.collect_base = {}
+        self._collect_acct = None
+        self._collect_key = None
         self._collect_seen = {}
         self._block_fails = {}
         self.refetch = {}

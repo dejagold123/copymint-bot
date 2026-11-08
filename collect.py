@@ -1,6 +1,7 @@
 """Forward part of every deposit from a collector wallet to a fixed destination, in the chain's own coin.
 
-Set in Railway:  COLLECT_TO=0xDESTINATION   COLLECT_WALLET=1 (the minter number that receives, default 1)
+Set in Railway:  COLLECT_TO=0xDESTINATION   COLLECT_PRIVATE_KEY=0x... (the wallet to watch and send from)
+Or, instead of a key, COLLECT_WALLET=1 uses one of your minters.
 Then /collect on. Each deposit is split: collect_percent (default 40) goes on to the destination, the rest stays.
 
 How a deposit is seen: the wallet's balance goes up. A balance that rises and then holds for two checks is a
@@ -12,11 +13,23 @@ from __future__ import annotations
 
 import time
 
+from eth_account import Account
+
 from helpers import *  # noqa: F401,F403
 
 
 class CollectMixin:
     def collect_wallet(self):
+        """The wallet that is watched and sent from: its own key if COLLECT_PRIVATE_KEY is set, else a minter."""
+        key = env("COLLECT_PRIVATE_KEY", "").strip()
+        if key:
+            if self._collect_acct is None or self._collect_key != key:
+                try:
+                    self._collect_acct = Account.from_key(key if key.startswith("0x") else "0x" + key)
+                except Exception:
+                    self._collect_acct = None  # never print the key
+                self._collect_key = key
+            return self._collect_acct
         raw = env("COLLECT_WALLET", "1").strip()
         if raw.isdigit() and 1 <= int(raw) <= len(self.minters):
             return self.minters[int(raw) - 1]
@@ -31,6 +44,8 @@ class CollectMixin:
             return "COLLECT_TO is not set to a valid address in Railway."
         acct = self.collect_wallet()
         if acct is None:
+            if env("COLLECT_PRIVATE_KEY", "").strip():
+                return "COLLECT_PRIVATE_KEY is not a valid private key."
             return "COLLECT_WALLET is not one of your minter numbers."
         if acct.address.lower() == self.collect_destination().lower():
             return "COLLECT_TO is the collector wallet itself."
@@ -137,7 +152,9 @@ class CollectMixin:
         if problem:
             lines.append(f"⚠️ {problem}")
         else:
-            lines.append(f"Wallet: #{self.minters.index(acct) + 1} {short_address(acct.address)}")
+            own = acct not in self.minters
+            lines.append(f"Wallet: {'its own key' if own else '#' + str(self.minters.index(acct) + 1)} {acct.address}")
+            lines.append("Send deposits to that address. Fund it with a little coin if it will forward tokens or needs gas.")
             lines.append(f"Forwards to: {self.collect_destination()}")
         lines.append(f"Share of each deposit sent on: {self.setting('collect_percent')}% (/settings collect_percent)")
         lines.append(f"Ignores deposits under: {self.setting('collect_minimum')} (/settings collect_minimum)")
