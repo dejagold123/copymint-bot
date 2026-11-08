@@ -30,6 +30,7 @@ from eth_utils import keccak, to_checksum_address
 import opensea
 import phases
 from helpers import *  # noqa: F401,F403
+from collect import CollectMixin
 from easy import EasyMixin
 from history import HistoryMixin
 from nftsend import SendMixin
@@ -224,6 +225,7 @@ def collections_html(want):
 
 
 MENU = (
+    ("collect", "💸 Forward part of deposits to your wallet"),
     ("history", "🗓 What is scheduled and what happened"),
     ("status", "📡 Copying, dry run, and wallets"),
     ("off", "⏸ Pause copying"),
@@ -525,7 +527,7 @@ def rewrite(data, old, new):
     return "0x" + data[2:].lower().replace(word(old), word(new))
 
 
-class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryMixin):
+class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryMixin, CollectMixin):
     def log(self, *args, **kwargs):
         return log(*args, **kwargs)
 
@@ -613,6 +615,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         self.autolist = {}
         self.ledger = []
         self.history = []
+        self.collect_base = {}
+        self._collect_seen = {}
         self._block_fails = {}
         self.refetch = {}
         self.send_plan = None
@@ -698,6 +702,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             self.settings = {k: v for k, v in (data.get("settings") or {}).items() if k in SETTING_SPEC}
             self.autolist = {str(k): v for k, v in (data.get("autolist") or {}).items() if isinstance(v, dict)}
             self.ledger = [e for e in (data.get("ledger") or []) if isinstance(e, dict)]
+            self.collect_base = {str(k): int(v) for k, v in (data.get("collect_base") or {}).items() if isinstance(v, int)}
             self.history = [e for e in (data.get("history") or []) if isinstance(e, dict) and "t" in e][-300:]
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
@@ -750,6 +755,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                 state["autolist"] = dict(self.autolist)
             if getattr(self, "ledger", None):
                 state["ledger"] = list(self.ledger[-3000:])
+            if getattr(self, "collect_base", None):
+                state["collect_base"] = dict(self.collect_base)
             if getattr(self, "history", None):
                 state["history"] = list(self.history[-300:])
             if self.watch_saved:
@@ -2171,6 +2178,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             return self.offer_command(args)
         if command == "/pnl":
             return self.pnl_command(args)
+        if command == "/collect":
+            return self.collect_command(args)
         if command in ("/history", "/log"):
             return self.history_command(args)
         if command in ("/help", "/start"):
@@ -3544,6 +3553,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         )
         if self.opensea:
             threading.Thread(target=self.autolist_loop, daemon=True).start()
+            threading.Thread(target=self.collect_loop, daemon=True).start()
         if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
             threading.Thread(target=self.control_loop, daemon=True).start()
             log("telegram controls enabled")
