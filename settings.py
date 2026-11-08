@@ -22,7 +22,7 @@ SPEC = {
     "confirm_trades": ("bool", False, None, None, "Ask for /confirm before /buy, /sweep, /list and /offer (off = they start at once, like /mint)"),
     "confirm_bulk": ("bool", True, None, None, "Ask for /confirm before /sellall, /unlist and /sendnfts (these move or sell many NFTs)"),
     "collect": ("bool", False, None, None, "Forward part of each deposit to COLLECT_TO (use /collect on)"),
-    "collect_percent": ("float", 40.0, 1.0, 100.0, "Percent of each deposit forwarded; the rest stays"),
+    "collect_percent": ("float", 40.0, 1.0, 100.0, "Percent of the wallet's whole balance forwarded when a deposit lands; the rest stays"),
     "collect_minimum": ("amount", "0", None, None, "Ignore deposits smaller than this, in the chain's coin"),
     "stream": ("bool", True, None, None, "Use OpenSea's live feed to wake /sweep the moment a listing appears"),
 }

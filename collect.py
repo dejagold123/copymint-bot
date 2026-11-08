@@ -2,11 +2,11 @@
 
 Set in Railway:  COLLECT_TO=0xDESTINATION   COLLECT_PRIVATE_KEY=0x... (the wallet to watch and send from)
 Or, instead of a key, COLLECT_WALLET=1 uses one of your minters.
-Then /collect on. Each deposit is split: collect_percent (default 40) goes on to the destination, the rest stays.
+Then /collect on. When a deposit lands, collect_percent (default 40) of the wallet's whole balance at that moment goes on to the destination; the rest stays.
 
 How a deposit is seen: the wallet's balance goes up. A balance that rises and then holds for two checks is a
-deposit; the extra is measured from a saved baseline. The part that stays becomes the new baseline, so it is
-never forwarded again. Nothing already in the wallet when you switch it on is forwarded.
+deposit; the baseline only tells the bot that something new arrived. The part that stays becomes the new baseline.
+Nothing is forwarded until a deposit lands after you switch it on; that deposit's share counts the whole balance.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class CollectMixin:
             extra = bal - base
             if extra <= 0 or extra < max(minimum, 1) or seen_before != bal:
                 continue  # nothing new, too small, or still arriving
-            amount = int(extra * percent / 100)
+            amount = int(bal * percent / 100)  # a share of everything in the wallet when the deposit lands
             try:
                 gas = self.estimate_gas(chain_id, acct, to, "0x", amount)
                 fee, _tip = self.fees(chain_id)
@@ -115,8 +115,8 @@ class CollectMixin:
             self.collect_base[key] = after if ok else base
             self._save()
             if ok:
-                out.append(f"{self.chains[chain_id].name}: {fmt_native(extra, chain_id)} arrived, forwarded {fmt_native(amount, chain_id)} to {short_address(to)} · tx {txh}")
-                self.hist_add("collect", "done", chain_id, to, f"{fmt_native(amount, chain_id)} of {fmt_native(extra, chain_id)} deposit")
+                out.append(f"{self.chains[chain_id].name}: {fmt_native(extra, chain_id)} arrived, forwarded {fmt_native(amount, chain_id)} ({percent:g}% of {fmt_native(bal, chain_id)}) to {short_address(to)} · tx {txh}")
+                self.hist_add("collect", "done", chain_id, to, f"{fmt_native(amount, chain_id)} ({percent:g}% of {fmt_native(bal, chain_id)} after a {fmt_native(extra, chain_id)} deposit)")
             else:
                 out.append(f"{self.chains[chain_id].name}: forward did not confirm in time ({txh})")
                 self.hist_add("collect", "failed", chain_id, to, "did not confirm")
@@ -156,7 +156,7 @@ class CollectMixin:
             lines.append(f"Wallet: {'its own key' if own else '#' + str(self.minters.index(acct) + 1)} {acct.address}")
             lines.append("Send deposits to that address. Fund it with a little coin if it will forward tokens or needs gas.")
             lines.append(f"Forwards to: {self.collect_destination()}")
-        lines.append(f"Share of each deposit sent on: {self.setting('collect_percent')}% (/settings collect_percent)")
+        lines.append(f"When a deposit lands, {self.setting('collect_percent')}% of the wallet's whole balance is sent on (/settings collect_percent)")
         lines.append(f"Ignores deposits under: {self.setting('collect_minimum')} (/settings collect_minimum)")
         lines.append("Commands: /collect on, /collect off, /collect reset")
         return "\n".join(lines)

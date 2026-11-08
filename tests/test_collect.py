@@ -40,19 +40,19 @@ class Collect(unittest.TestCase):
     def setUp(self):
         self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("COLLECT_TO", "COLLECT_WALLET")])
 
-    def test_forwards_40_percent_of_a_deposit_once_it_holds(self):
+    def test_forwards_40_percent_of_the_whole_balance_once_the_deposit_holds(self):
         b = collector({"v": 1 * ETH})
         run(b)
         self.assertEqual(b.collect_cycle(), [])  # first look sets the starting point
-        b.balance_now["v"] += ETH  # a deposit of 1
+        b.balance_now["v"] += ETH  # a deposit of 1 on top of 1: the wallet now holds 2
         self.assertEqual(b.collect_cycle(), [])  # still arriving: wait for it to hold
         lines = b.collect_cycle()
         self.assertEqual(len(lines), 1)
-        self.assertEqual(b.sent, [(DEST, int(0.4 * ETH))])
-        self.assertEqual(b.collect_cycle(), [])  # the 60% that stayed is not forwarded again
-        self.assertEqual(b.sent, [(DEST, int(0.4 * ETH))])
+        self.assertEqual(b.sent, [(DEST, int(0.8 * ETH))])  # 40% of 2, not of the deposit
+        self.assertEqual(b.collect_cycle(), [])  # what stayed is not forwarded again
+        self.assertEqual(len(b.sent), 1)
 
-    def test_existing_balance_is_never_forwarded(self):
+    def test_existing_balance_waits_for_a_deposit(self):
         b = collector({"v": 5 * ETH})
         run(b)
         for _ in range(4):
@@ -65,10 +65,10 @@ class Collect(unittest.TestCase):
         b.collect_cycle()
         b.balance_now["v"] = ETH  # a mint spent 1
         b.collect_cycle()
-        b.balance_now["v"] = ETH + ETH // 2  # now 0.5 arrives
+        b.balance_now["v"] = ETH + ETH // 2  # now 0.5 arrives: the wallet holds 1.5
         b.collect_cycle()
         b.collect_cycle()
-        self.assertEqual(b.sent, [(DEST, int(0.2 * ETH))])
+        self.assertEqual(b.sent, [(DEST, int(0.6 * ETH))])
 
     def test_small_deposits_and_the_minimum(self):
         b = collector({"v": ETH})
