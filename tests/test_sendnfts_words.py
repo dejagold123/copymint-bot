@@ -25,7 +25,7 @@ class EasySendCommand(unittest.TestCase):
         self.b = node(make_bot(MINTER_PRIVATE_KEYS=KEYS + ",0x" + "33" * 32))
 
     def test_the_users_form(self):
-        reply, (dest, accounts, chains, extra, deep, given) = run(self.b, "from", "wallet", "2", "to", "wallet", "1", f"collection={COLLECTION}")
+        reply, (dest, accounts, chains, extra, deep, given, limit) = run(self.b, "from", "wallet", "2", "to", "wallet", "1", f"collection={COLLECTION}")
         self.assertIn("Looking for NFTs in 1 wallet", reply)
         self.assertEqual(dest, self.b.minters[0].address.lower())
         self.assertEqual([a.address for a in accounts], [self.b.minters[1].address])
@@ -40,7 +40,7 @@ class EasySendCommand(unittest.TestCase):
         self.assertEqual((dest, len(accounts)), (DEST, 3))
         _r, (dest, accounts, *_rest) = run(self.b, "send", "all", "nfts", "to", "wallet", "1", "from", "wallet", "2", "deep")
         self.assertEqual((dest, [a.address for a in accounts]), (m[0].address.lower(), [m[1].address]))
-        _r, (dest, accounts, chains, extra, deep, given) = run(self.b, "FROM", "Wallet", "2", "TO", "Wallet", "1", "deep")
+        _r, (dest, accounts, chains, extra, deep, given, limit) = run(self.b, "FROM", "Wallet", "2", "TO", "Wallet", "1", "deep")
         self.assertTrue(deep)
         _r, (dest, accounts, *_rest) = run(self.b, "from", "2", "to", "wallet", "3")
         self.assertEqual(dest, m[2].address.lower())
@@ -194,3 +194,40 @@ class CollectionFilter(unittest.TestCase):
         seen.clear()
         everything = b.find_nfts(4663, b.minters[0], [])
         self.assertEqual(len(everything), 2)
+
+
+class SendCount(unittest.TestCase):
+    def test_count_words_and_options(self):
+        from nftsend import pull_count_words
+
+        self.assertEqual(pull_count_words(["send", "5", "nfts", "from", "wallet", "1"]), (["from", "wallet", "1"], "5"))
+        self.assertEqual(pull_count_words(["3", "nfts", "to", "wallet", "2"]), (["to", "wallet", "2"], "3"))
+        self.assertEqual(pull_count_words(["first", "7", "to", "1"]), (["to", "1"], "7"))
+        self.assertEqual(pull_count_words(["count=4", "to", "1"]), (["count=4", "to", "1"], None))
+        self.assertEqual(pull_count_words(["from", "wallet", "2", "to", "wallet", "1"]), (["from", "wallet", "2", "to", "wallet", "1"], None))
+
+    def test_the_plan_stops_at_the_count(self):
+        b = make_bot()
+        chain = None
+        wallet = b.minters[0]
+        b.find_nfts = lambda *a, **k: [{"collection": C721, "std": 721, "items": [(i, 1) for i in range(1, 11)], "missing": 0}]
+        b.rpc.call = lambda chain_id, method, params: "0x5208"
+        b.has_code = lambda *a: True
+        b.collection_name = lambda *a: "Yokai"
+        b.fees = lambda c: (1, 1)
+        b.balance = lambda *a: 10**18
+        sent = []
+        b.notify = sent.append
+        b.prepare_send(DEST, [wallet], [4663], [], False, (), 3)
+        self.assertEqual(len(b.send_plan["transfers"]), 3)
+        self.assertEqual([t["id"] for t in b.send_plan["transfers"]], ["1", "2", "3"])
+        self.assertIn("Limited to 3", sent[0])
+
+    def test_the_command_reads_count(self):
+        b = make_bot()
+        calls = []
+        with mock.patch.object(bot.threading, "Thread") as thread:
+            b.sendnfts_command(["send", "2", "nfts", "from", "wallet", "1", "to", "wallet", "2"])
+            args = thread.call_args.kwargs["args"]
+        self.assertEqual(args[-1], 2)
+        self.assertIn("count=", b.sendnfts_command(["count=x", "from", "1", "to", "2"]))

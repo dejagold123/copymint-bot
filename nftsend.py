@@ -15,6 +15,27 @@ from helpers import *  # noqa: F401,F403
 import opensea
 
 
+COUNT_PREFIXES = ("count=", "qty=", "limit=", "number=", "amount=", "n=")
+
+
+def pull_count_words(args):
+    """'send 5', 'first 5' or '5 nfts' in the words becomes a count. Returns (args without those words, count text or None)."""
+    words = [a.lower() for a in args]
+    if any(w.startswith(COUNT_PREFIXES) for w in words):
+        return list(args), None
+    for i, word in enumerate(words):
+        if not word.isdigit():
+            continue
+        before = words[i - 1] if i else ""
+        after = words[i + 1] if i + 1 < len(words) else ""
+        if after in ("nft", "nfts"):
+            first = i - 1 if before in ("send", "first") else i
+            return list(args[:first]) + list(args[i + 2 :]), word
+        if before in ("send", "first"):
+            return list(args[: i - 1]) + list(args[i + 1 :]), word
+    return list(args), None
+
+
 class SendMixin:
     def natural_send_args(self, args):
         """Turn 'from wallet 2 to wallet 1 collection=0x…' into the options the command already understands.
@@ -68,6 +89,7 @@ class SendMixin:
             "✏️ Usage, easy form: /sendnfts from wallet 2 to wallet 1 collection=0xabc…\n"
             "(from takes minter numbers like 1,3 or all, to takes one minter number or an 0x address; numbers are as /minters lists them.)\n"
             "Full form: /sendnfts 0xDESTINATION [wallets=1,3] [chain=robinhood] [collection=0xabc…] [deep]\n"
+            "Add count=5 (or 'send 5 nfts') to send only that many.\n"
             "Sends every NFT the chosen minters hold (default: all minters, all enabled chains) to the destination. With collection=0xabc… it sends only that collection.\n"
             "I list what I found and what it will cost, then you send /sendnfts confirm within 2 minutes, or /sendnfts cancel.\n"
             "I know the NFTs your minters minted through this bot since this feature was added. For older NFTs add collection=0xabc… "
@@ -104,6 +126,9 @@ class SendMixin:
         with self._send_lock:
             if self.send_plan and self.send_plan["state"] in ("running", "stopping"):
                 return "A send is already running or stopping. Send /sendnfts cancel to stop it."
+        args, count_word = pull_count_words(args)
+        if count_word is not None:
+            args.append(f"count={count_word}")
         args, natural_error = self.natural_send_args(args)
         if natural_error:
             return natural_error
@@ -116,6 +141,12 @@ class SendMixin:
         chain_word = self.pull_option(args, ("chain=", "c="))
         collection_spec = self.pull_option(args, ("collection=", "collections="))
         ids_spec = self.pull_option(args, ("ids=", "id="))
+        count_spec = self.pull_option(args, COUNT_PREFIXES)
+        limit = None
+        if count_spec is not None:
+            if not count_spec.isdigit() or int(count_spec) < 1:
+                return "⚠️ count= must be a whole number like count=5."
+            limit = int(count_spec)
         accounts, error = self.choose_minters(wallet_spec)
         if error:
             return error
@@ -147,15 +178,18 @@ class SendMixin:
             return "⚠️ That is not a valid destination address.\n" + usage
         if int(dest, 16) == 0:
             return "⚠️ I will not send NFTs to the zero address."
-        threading.Thread(target=self.prepare_send, args=(dest, accounts, chain_ids, extra, deep, given), daemon=True).start()
+        threading.Thread(target=self.prepare_send, args=(dest, accounts, chain_ids, extra, deep, given, limit), daemon=True).start()
         return f"🔎 Looking for NFTs in {len(accounts)} wallet(s) on {', '.join(self.chains[c].name for c in chain_ids)}. The plan follows in a moment."
 
-    def prepare_send(self, dest, accounts, chain_ids, extra, deep, given=()):
+    def prepare_send(self, dest, accounts, chain_ids, extra, deep, given=(), limit=None):
         try:
             transfers, blocked, missing, skipped = [], [], [], []
             names = {}
+            room = limit  # NFTs still allowed under count=; None means no limit
             for chain_id in chain_ids:
                 for acct in accounts:
+                    if room is not None and room <= 0:
+                        break
                     if acct.address.lower() == dest:
                         skipped.append(acct.address)
                         continue
@@ -168,6 +202,10 @@ class SendMixin:
                         if group["missing"]:
                             missing.append((chain_id, acct.address, group["collection"], group["missing"], group.get("note", "")))
                         for token_id, amount in group["items"]:
+                            if room is not None:
+                                if room <= 0:
+                                    break
+                                amount = min(amount, room)
                             data = self.transfer_data(group["std"], acct.address, dest, token_id, amount)
                             transfer = {
                                 "chain": chain_id,
@@ -183,11 +221,13 @@ class SendMixin:
                                 )
                                 transfer["gas"] = int(estimate * 1.3) + 20_000
                                 transfers.append(transfer)
+                                if room is not None:
+                                    room -= amount
                             except Exception as exc:
                                 reason = decode_revert("", str(exc)) or "the contract refused the transfer"
                                 blocked.append((transfer, self.refusal_reason(chain_id, transfer, dest, reason), names.get((chain_id, group["collection"]))))
             shortfalls = self.gas_shortfalls(transfers)
-            plan = {"dest": dest, "transfers": transfers, "shortfalls": shortfalls, "created": time.time(), "state": "planned", "blocked": len(blocked), "cancel": threading.Event()}
+            plan = {"dest": dest, "transfers": transfers, "shortfalls": shortfalls, "created": time.time(), "state": "planned", "blocked": len(blocked), "limit": limit, "cancel": threading.Event()}
             text = self.send_plan_text(plan, names, blocked, missing, skipped, deep)
             with self._send_lock:
                 if transfers and not (self.send_plan and self.send_plan["state"] == "running"):
@@ -256,6 +296,9 @@ class SendMixin:
         else:
             total = sum(t["amount"] for t in transfers)
             body = "\n".join(lines) + f"\nTotal: {total} NFT(s) in {len(transfers)} transfer(s)\n"
+            if plan.get("limit"):
+                found = "all that were found" if total < plan["limit"] else "the first ones found"
+                body += f"Limited to {plan['limit']} by count= ({found}).\n"
             for chain_id in sorted({t["chain"] for t in transfers}):
                 kind = self.code_kind(chain_id, plan["dest"])
                 if kind == "contract":
