@@ -113,28 +113,43 @@ If the websocket line is missing, re-check `WSS_4663`. If you see nothing at all
 
 ## Telegram commands reference
 
-Type `/` in the chat with your bot to see the menu.
+Type `/` in the chat with your bot to see the menu. Wallets are numbered as `/minters` lists them, so `wallets=1,3` means your first and third minter. The [README](README.md#telegram-commands) has the full list with every option.
 
 | Command | What it does |
 |---|---|
-| `/status` | Shows whether copying is on or paused, dry run, chains, websocket state and waiting retries |
-| `/on` | Resumes copying |
-| `/off` | Pauses copying. The bot keeps watching but skips new mints |
-| `/wallets` | Lists the watched wallets |
-| `/watch 0xADDRESS` | Adds one or more wallets to watch, separated by spaces |
-| `/unwatch 0xADDRESS` | Removes a wallet. The last one cannot be removed, so use `/off` to stop |
-| `/minters` | Shows your numbered minter and funder addresses, never the keys |
-| `/balance` | Shows each minter's native balance on every chain |
-| `/cap` | Shows the mint cap per chain. `/cap 4663 0.1` sets one chain, `/cap all 0.05` sets all |
-| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE] [wallets=1,3]` | Mints a public-mint contract with every minter (or only the numbered ones in `wallets=`, as `/minters` lists them), without a watched wallet. Quantity defaults to 1. If you leave out the price, it is read from the contract |
-| `/sendnfts 0xDESTINATION [wallets=1,3]` | Sends every NFT your minters hold to the wallet you name. It shows a plan first; send `/sendnfts confirm` within 2 minutes to go ahead, or `/sendnfts cancel`. It knows the NFTs minted through the bot since this feature was added; add `collection=0xabc…` or `deep` for older ones |
-| `/help` | Lists the commands |
+| `/status` | Copying on or paused, dry run, chains, websocket state, waiting retries |
+| `/on`, `/off` | Resume or pause copying. `/off` does not stop `/mint`, `/snipe`, `/buy` and the other commands |
+| `/wallets`, `/watch 0xADDRESS`, `/unwatch 0xADDRESS` | List, add or remove watched wallets. The last one cannot be removed |
+| `/minters`, `/balance` | Your numbered minter and funder addresses (never the keys), and their native balances |
+| `/cap`, `/cap 4663 0.1`, `/cap all 0.05` | Show or set the mint cap per chain |
+| `/mint 0xCONTRACT [QTY] [PRICE] [wallets=1,3]` | Mint a public-mint contract with your minters. The price is read from the contract if you leave it out |
+| `/snipe 0xCONTRACT [QTY] [PRICE] 10m` or `5pm UTC` | Schedule a mint for a countdown or a clock time. `/snipe cancel` stops it |
+| `/sendnfts from wallet 2 to wallet 1 collection=0xabc… [count=5]` | Send NFTs your minters hold. It starts after showing its plan, or waits for `/sendnfts confirm` (the default for this command) |
+| `/collect on` / `off` | Forward part of every deposit to a wallet you set in Railway (see Step 8) |
+| `/history`, `/pnl` | What is scheduled and what happened, and what you spent and made |
+| `/settings` | See and change saved settings |
+| `/buy`, `/sweep`, `/list`, `/sellall`, `/unlist`, `/offer` | OpenSea trading. They need `OPENSEA_API_KEY` (see Step 8) |
+| `/help` | List the commands |
 
 Notes:
 
+- You can type commands in plain words, for example `/buy 0xabc… 123 under 0.01 wallet 2 at 5pm UTC` or `/mint 0xabc… 2`.
 - Wallets added or removed from Telegram are saved and then replace `WATCH_ADDRESSES`. Changing that variable later has no effect until the saved state is cleared.
 - A cap set with `/cap` is saved and beats the variable. It can be at most 1 native coin per chain. For a higher cap, change `MAX_MINT_ETH` or `MAX_MINT_<chainId>` in Railway.
-- `/mint` tries the common mint calls and checks each with a simulation first. It cannot do allowlist, signed or website-only mints.
+- `/mint` and `/snipe` try the common mint calls and check each with a simulation first. They cannot do website-only mints.
+- `/buy`, `/sweep`, `/list`, `/offer` and `/snipe` start right after showing their plan. If you want a confirm step first, send `/settings confirm_trades on`.
+
+## Step 8: Optional extras
+
+**OpenSea trading.** Create an API key in OpenSea's developer settings and add `OPENSEA_API_KEY` in Railway, then redeploy. Also set `MAX_BUY_ETH` (default `0.05`), the most any one purchase or offer may cost. Try `/buy` on a single cheap NFT first. These features are the least proven in the bot.
+
+**Auto-listing.** `/settings autolist on` lists every NFT the bot mints or buys at twice its top offer (`/settings autolist_multiple 3` changes the multiple). It only ever raises a price, never lowers one.
+
+**Forwarding deposits.** Add `COLLECT_TO=0xDestination` and `COLLECT_PRIVATE_KEY=0xKeyOfTheWalletToWatch` in Railway, redeploy, then send `/collect on`. When coin arrives in that wallet, 40 percent of its balance goes to the destination (`/settings collect_percent 40` changes it). Use a pass-through wallet that holds nothing else.
+
+**Another chain.** Add its chain ID to `CHAINS` and its URLs as `RPC_<chainId>` and `WSS_<chainId>`. Ink (57073) is built in. A chain the bot does not list works too if you set `RPC_<chainId>` (and optionally `CHAIN_NAME_<chainId>`).
+
+**Protect the bot.** Anyone holding your Telegram bot token can control your bot. If it ever leaks, send `/revoke` to @BotFather and put the new token in Railway.
 
 ## Variables reference
 
@@ -143,7 +158,7 @@ Notes:
 | `WATCH_ADDRESSES` | none | Wallets to copy, comma-separated |
 | `MINTER_PRIVATE_KEYS` | none | Your minter keys, comma-separated |
 | `FUNDER_PRIVATE_KEY` | empty | Optional wallet that funds minters from other chains |
-| `CHAINS` | all supported | Chain IDs to use: 1, 10, 56, 137, 8453, 42161, 999, 4663 |
+| `CHAINS` | all supported | Chain IDs to use: 1, 10, 56, 137, 8453, 42161, 999, 4663, 57073 |
 | `RPC_<chainId>` | public RPC | Dedicated HTTPS RPC per chain. Set this for any chain you care about |
 | `WSS_<chainId>` | none | WebSocket URL per chain for near-instant detection |
 | `WSS_BACKUP_SECONDS` | `30` | How often to check the latest block while the socket is live (one cheap request) |
@@ -160,6 +175,11 @@ Notes:
 | `TELEGRAM_CHAT_ID` | empty | The one chat that gets alerts and may give commands |
 | `STATE_PATH` | `/data/state.json` | Where state is saved. Needs a volume to survive restarts |
 | `DRY_RUN` | `false` | Log what would be sent but broadcast and bridge nothing |
+| `OPENSEA_API_KEY` | empty | Needed for the OpenSea commands and OpenSea collection names |
+| `MAX_BUY_ETH` | `0.05` | The most one OpenSea purchase or offer may cost |
+| `COLLECT_TO`, `COLLECT_PRIVATE_KEY` | empty | Destination and source wallet for `/collect` |
+
+See the README for every other variable.
 
 ## Troubleshooting and limits
 
