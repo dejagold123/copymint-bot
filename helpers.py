@@ -109,6 +109,11 @@ def fmt_native(wei, chain_id):
     text = f"{amount:.4f}" if amount >= Decimal("0.0001") or amount == 0 else f"{amount:.6f}"
     return f"{text} {native_symbol(chain_id)}"
 
+def fmt_exact(wei, chain_id):
+    """Like fmt_native but with 7 decimals, so two close amounts do not print the same."""
+    amount = Decimal(int(wei)) / Decimal(10**18)
+    return f"{amount:.7f} {native_symbol(chain_id)}"
+
 def decode_abi_string(raw):
     """Decode the return value of a function that returns one string. Returns '' if it is not one."""
     try:
@@ -186,8 +191,10 @@ def decode_revert(data, message=""):
             return f"the contract hit an internal error (panic code 0x{code})"
         elif sel in REVERT_BY_SELECTOR:
             return REVERT_BY_SELECTOR[sel]
+        else:
+            return f"the contract rejected it with a custom error I do not recognise ({sel})"
     text = re.sub(r"^.*?(execution reverted:?|reverted:?)", "", message, flags=re.I).strip(" :\"'")
-    if text and not text.lower().startswith(("0x", "execution")):
+    if text and re.match(r"[A-Za-z]", text) and "'data'" not in text and "{" not in text and not text.lower().startswith(("0x", "execution")):
         return f"the contract said \"{text[:120]}\""
     return ""
 

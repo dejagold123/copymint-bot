@@ -183,7 +183,7 @@ class SendMixin:
                                 transfers.append(transfer)
                             except Exception as exc:
                                 reason = decode_revert("", str(exc)) or "the contract refused the transfer"
-                                blocked.append((transfer, reason))
+                                blocked.append((transfer, self.refusal_reason(chain_id, transfer, dest, reason), names.get((chain_id, group["collection"]))))
             shortfalls = self.gas_shortfalls(transfers)
             plan = {"dest": dest, "transfers": transfers, "shortfalls": shortfalls, "created": time.time(), "state": "planned", "blocked": len(blocked), "cancel": threading.Event()}
             text = self.send_plan_text(plan, names, blocked, missing, skipped, deep)
@@ -196,6 +196,28 @@ class SendMixin:
         except Exception as exc:
             self.log(f"/sendnfts plan {type(exc).__name__}: {exc}")
             self.notify(f"⚠️ /sendnfts failed while looking for NFTs: {type(exc).__name__}")
+
+    def code_kind(self, chain_id, address):
+        """'none' (a plain wallet), 'delegated' (a wallet with EIP-7702 smart-account code), 'contract', or None if unknown."""
+        try:
+            code = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(address), "latest"])
+        except Exception:
+            return None
+        code = (code or "0x").lower()
+        if code in ("0x", "0x0"):
+            return "none"
+        return "delegated" if code.startswith("0xef0100") and len(code) == 2 + 46 else "contract"
+
+    def refusal_reason(self, chain_id, transfer, dest, reason):
+        """Say why a 721 transfer was refused: the receiver, or the collection itself. Tries a plain transferFrom."""
+        if transfer["std"] != 721:
+            return reason
+        try:
+            plain = "0x23b872dd" + addr_word(transfer["wallet"]) + addr_word(dest) + uint_word(int(transfer["id"]))
+            self.rpc.call(chain_id, "eth_estimateGas", [{"from": to_checksum_address(transfer["wallet"]), "to": to_checksum_address(transfer["collection"]), "data": plain, "value": "0x0"}])
+        except Exception:
+            return reason + "; a plain transfer fails too, so the collection itself blocks moving this NFT (locked, soulbound or restricted)"
+        return reason + "; a plain transfer would work, so the receiving address is what rejects it"
 
     def gas_shortfalls(self, transfers):
         """(chain, wallet, balance, needed) for each wallet that cannot pay for its transfers."""
@@ -232,15 +254,26 @@ class SendMixin:
         else:
             total = sum(t["amount"] for t in transfers)
             body = "\n".join(lines) + f"\nTotal: {total} NFT(s) in {len(transfers)} transfer(s)\n"
-            if any(self.has_code(c, plan["dest"]) for c in {t["chain"] for t in transfers}):
-                body += "⚠️ The destination is a contract on one of these chains. Double-check that it can receive NFTs.\n"
+            for chain_id in sorted({t["chain"] for t in transfers}):
+                kind = self.code_kind(chain_id, plan["dest"])
+                if kind == "contract":
+                    body += f"⚠️ The destination is a contract on {self.chains[chain_id].name}. Double-check that it can receive NFTs.\n"
+                elif kind == "delegated":
+                    body += f"⚠️ The destination has smart-account code (EIP-7702) on {self.chains[chain_id].name}. It is still a normal wallet, but some NFTs may be refused if that code cannot receive them.\n"
         for chain_id, wallet, have, need in plan.get("shortfalls", []):
             body += (
-                f"⚠️ #{numbers.get(wallet, '?')} {short_address(wallet)} on {self.chains[chain_id].name} has {fmt_native(have, chain_id)} "
-                f"but needs about {fmt_native(need, chain_id)} for gas. Fund it first or these will fail.\n"
+                f"⚠️ #{numbers.get(wallet, '?')} {short_address(wallet)} on {self.chains[chain_id].name} has {fmt_exact(have, chain_id)} "
+                f"but needs about {fmt_exact(need, chain_id)} for gas. Fund it first or these will fail.\n"
             )
         if blocked:
-            body += f"Cannot send {len(blocked)} NFT(s) (the contract refused the transfer): {blocked[0][1]}\n"
+            by = {}
+            for transfer, why, name in blocked:
+                by.setdefault((name or short_address(transfer["collection"]), why), []).append(transfer)
+            body += f"Cannot send {len(blocked)} NFT(s):\n"
+            for (name, why), items in list(by.items())[:8]:
+                body += f"• {name} ×{len(items)}: {why}\n"
+            if len(by) > 8:
+                body += f"…and {len(by) - 8} more kind(s)\n"
         if missing:
             more = sum(m[3] for m in missing)
             body += f"{more} more NFT(s) are held but I cannot list their token IDs."

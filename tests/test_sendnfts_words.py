@@ -137,3 +137,37 @@ class GasWarning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefusalDiagnosis(unittest.TestCase):
+    def test_unknown_custom_error_is_named_not_garbled(self):
+        from helpers import decode_revert
+
+        text = decode_revert("", "execution reverted {'message': 'execution reverted', 'data': '0x369c2f4c'}")
+        self.assertIn("0x369c2f4c", text)
+        self.assertNotIn("'data'", text)
+        self.assertNotIn("{", decode_revert("", "execution reverted: ', 'data': {x}"))
+
+    def test_code_kinds(self):
+        b = make_bot()
+        for code, want in (("0x", "none"), ("0xef0100" + "ab" * 20, "delegated"), ("0x6080604052", "contract")):
+            b.rpc.call = lambda chain, method, params, code=code: code
+            self.assertEqual(b.code_kind(4663, DEST), want)
+
+    def test_refusal_says_whether_the_receiver_or_the_collection_is_to_blame(self):
+        b = make_bot()
+        t = {"std": 721, "wallet": "0x" + "11" * 20, "collection": C721, "id": "5"}
+        b.rpc.call = lambda chain, method, params: "0x5208"  # a plain transfer works
+        self.assertIn("receiving address", b.refusal_reason(4663, t, DEST, "refused"))
+
+        def fail(chain, method, params):
+            raise RuntimeError("execution reverted")
+
+        b.rpc.call = fail
+        self.assertIn("collection itself", b.refusal_reason(4663, t, DEST, "refused"))
+
+    def test_plan_groups_refusals_by_collection(self):
+        b = make_bot()
+        t = {"chain": 4663, "wallet": "0x" + "11" * 20, "collection": C721, "std": 721, "id": "1", "amount": 1}
+        text = b.send_plan_text({"dest": DEST, "transfers": [], "shortfalls": []}, {}, [(t, "locked", "Yokai"), (dict(t, id="2"), "locked", "Yokai")], [], [], False)
+        self.assertIn("• Yokai ×2: locked", text)
