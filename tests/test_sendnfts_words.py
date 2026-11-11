@@ -171,3 +171,26 @@ class RefusalDiagnosis(unittest.TestCase):
         t = {"chain": 4663, "wallet": "0x" + "11" * 20, "collection": C721, "std": 721, "id": "1", "amount": 1}
         text = b.send_plan_text({"dest": DEST, "transfers": [], "shortfalls": []}, {}, [(t, "locked", "Yokai"), (dict(t, id="2"), "locked", "Yokai")], [], [], False)
         self.assertIn("• Yokai ×2: locked", text)
+
+
+class CollectionFilter(unittest.TestCase):
+    def test_collection_means_only_that_collection(self):
+        b = make_bot()
+        wallet = b.minters[0].address.lower()
+        other = "0x" + "c9" * 20
+        b.holdings[f"4663:{C721}:{wallet}"] = {"std": 721, "ids": ["1"]}
+        b.holdings[f"4663:{other}:{wallet}"] = {"std": 721, "ids": ["2"]}
+        seen = []
+
+        def nfts(chain, collection, w, recorded, deep, given):
+            seen.append(collection)
+            return [int(i) for i in recorded], 0, ""
+
+        b.nfts_721 = nfts
+        b.detect_standard = lambda *a: 721
+        found = b.find_nfts(4663, b.minters[0], [C721], only=True)
+        self.assertEqual([g["collection"] for g in found], [C721.lower()])
+        self.assertEqual(seen, [C721.lower()])
+        seen.clear()
+        everything = b.find_nfts(4663, b.minters[0], [])
+        self.assertEqual(len(everything), 2)

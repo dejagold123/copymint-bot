@@ -68,7 +68,7 @@ class SendMixin:
             "✏️ Usage, easy form: /sendnfts from wallet 2 to wallet 1 collection=0xabc…\n"
             "(from takes minter numbers like 1,3 or all, to takes one minter number or an 0x address; numbers are as /minters lists them.)\n"
             "Full form: /sendnfts 0xDESTINATION [wallets=1,3] [chain=robinhood] [collection=0xabc…] [deep]\n"
-            "Sends every NFT the chosen minters hold (default: all minters, all enabled chains) to the destination.\n"
+            "Sends every NFT the chosen minters hold (default: all minters, all enabled chains) to the destination. With collection=0xabc… it sends only that collection.\n"
             "I list what I found and what it will cost, then you send /sendnfts confirm within 2 minutes, or /sendnfts cancel.\n"
             "I know the NFTs your minters minted through this bot since this feature was added. For older NFTs add collection=0xabc… "
             "(finds them if the collection can list a wallet's tokens), deep (checks token by token, collections up to "
@@ -160,7 +160,9 @@ class SendMixin:
                         skipped.append(acct.address)
                         continue
                     where = [c for c in extra if self.has_code(chain_id, c)]
-                    for group in self.find_nfts(chain_id, acct, where, deep, given):
+                    if extra and not where:
+                        continue  # a collection was named and it is not on this chain: send nothing from here
+                    for group in self.find_nfts(chain_id, acct, where, deep, given, only=bool(extra)):
                         name = self.collection_name(chain_id, group["collection"]) or short_address(group["collection"])
                         names[(chain_id, group["collection"])] = name
                         if group["missing"]:
@@ -284,7 +286,7 @@ class SendMixin:
             if notes:
                 body += " Why: " + "; ".join(notes) + "."
             elif not deep:
-                body += " Add collection=0xabc… and deep to look harder."
+                body += " Add collection=0xabc… and deep to look harder (collection= then sends only that collection)."
             body += "\n"
         if skipped:
             body += "Skipped (already the destination): " + ", ".join(short_address(a) for a in skipped) + "\n"
@@ -401,7 +403,7 @@ class SendMixin:
         if not entry["ids"]:
             self.holdings.pop(key, None)
 
-    def find_nfts(self, chain_id, acct, extra=(), deep=False, given=()):
+    def find_nfts(self, chain_id, acct, extra=(), deep=False, given=(), only=False):
         """Everything this wallet holds on one chain: a list of dicts with collection, std, items and missing."""
         wallet = acct.address.lower()
         hints = {}
@@ -413,6 +415,10 @@ class SendMixin:
             cid, _, collection = key.partition(":")
             if cid == str(chain_id) and wallet in holders:
                 hints.setdefault(collection.lower(), (None, []))
+        if only:
+            # collection= was typed: send from those collections and nothing else.
+            wanted = {c.lower() for c in extra}
+            hints = {c: v for c, v in hints.items() if c in wanted}
         for collection in extra:
             hints.setdefault(collection.lower(), (None, []))
         found = []
