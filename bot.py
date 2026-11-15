@@ -10,6 +10,7 @@ transaction is replaced once if it is still pending after two blocks.
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import os
 import re
@@ -19,7 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -480,25 +481,72 @@ class Chain:
 
 
 class RPC:
-    def __init__(self, chains: dict[int, Chain]):
+    """JSON-RPC over kept-alive connections (one per thread and endpoint), so a send does not pay for a new TLS handshake.
+
+    extras maps a chain ID to more endpoints; broadcast() sends one signed transaction to all of them and the first
+    to accept wins.
+    """
+
+    def __init__(self, chains: dict[int, Chain], extras: dict[int, list[str]] | None = None):
         self.chains = chains
+        self.extras = extras or {}
+        self._local = threading.local()
+
+    def _post(self, url, body, timeout):
+        parts = urllib.parse.urlsplit(url)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        pool = self._local.__dict__.setdefault("pool", {})
+        headers = {"content-type": "application/json", "user-agent": "copymint-bot", "connection": "keep-alive"}
+        for attempt in (0, 1):
+            conn = pool.get(url)
+            if conn is None:
+                factory = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+                conn = pool[url] = factory(parts.netloc, timeout=timeout)
+            conn.timeout = timeout
+            try:
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                conn.request("POST", path, body, headers)
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            except (http.client.HTTPException, OSError):
+                try:
+                    conn.close()
+                finally:
+                    pool.pop(url, None)
+                if attempt:
+                    raise
+
+    def _call_url(self, url, method, params, timeout):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+        status, raw = self._post(url, body, timeout)
+        if status >= 400:
+            raise RuntimeError(f"{method} {status} {raw.decode(errors='replace')[:240]}")
+        data = json.loads(raw)
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        return data["result"]
 
     def call(self, chain_id, method, params, timeout=25):
-        url = self.chains[chain_id].rpc
-        req = urllib.request.Request(
-            url,
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
-            headers={"content-type": "application/json", "user-agent": "copymint-bot"},
-        )
+        return self._call_url(self.chains[chain_id].rpc, method, params, timeout)
+
+    def broadcast(self, chain_id, raw, timeout=10):
+        """Send one signed transaction to every endpoint of the chain at once. Returns the first hash, else raises."""
+        urls = [self.chains[chain_id].rpc] + [u for u in self.extras.get(chain_id, []) if u != self.chains[chain_id].rpc]
+        if len(urls) == 1:
+            return self._call_url(urls[0], "eth_sendRawTransaction", [raw], timeout)
+        pool = ThreadPoolExecutor(max_workers=len(urls))
+        futures = {pool.submit(self._call_url, url, "eth_sendRawTransaction", [raw], timeout): i for i, url in enumerate(urls)}
+        errors = {}
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode()[:240]
-            raise RuntimeError(f"{method} {exc.code} {detail}") from exc
-        if body.get("error"):
-            raise RuntimeError(body["error"])
-        return body["result"]
+            for future in as_completed(futures):
+                try:
+                    return future.result()
+                except Exception as exc:
+                    errors[futures[future]] = exc
+            raise errors.get(0) or next(iter(errors.values()))
+        finally:
+            pool.shutdown(wait=False)
 
 
 def load_keys(raw):
@@ -574,7 +622,14 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                 # The value is not echoed, because the URL usually contains an API key.
                 raise SystemExit(f"WSS_{cid} must start with wss://")
             chains[cid] = Chain(cid, name, env(f"RPC_{cid}", default), wss)
-        self.rpc = RPC(chains)
+        extras = {}
+        for cid in chains:
+            urls = [u.strip() for u in env(f"RPC_EXTRA_{cid}", "").split(",") if u.strip()]
+            if any(not u.startswith(("https://", "http://")) for u in urls):
+                raise SystemExit(f"RPC_EXTRA_{cid} must be http(s) URLs, comma-separated")
+            if urls:
+                extras[cid] = urls
+        self.rpc = RPC(chains, extras)
         self.chains = chains
         # Caps are in each chain's native coin (ETH, BNB, POL...). MAX_MINT_<chainId> overrides the default.
         default_cap = env("MAX_MINT_ETH", "0.05")
@@ -651,7 +706,10 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         self.wss_backup_scan = flag("WSS_BACKUP_SCAN")
         # Chains whose socket just connected or dropped; they get one full catch-up scan.
         self.ws_gap = set()
-        self.snipe_retry = max(0.1, float(env("SNIPE_RETRY_SECONDS", "0.5")))
+        self.snipe_retry = max(0.02, float(env("SNIPE_RETRY_SECONDS", "0.1")))
+        self.snipe_tip_multiplier = min(20.0, max(1.0, float(env("SNIPE_TIP_MULTIPLIER", "1"))))
+        self.snipe_early = min(2.0, max(0.0, float(env("SNIPE_FIRE_EARLY_MS", "0")) / 1000))
+        self.snipe_poll_lead = min(30.0, max(0.0, float(env("SNIPE_POLL_LEAD_SECONDS", "2"))))
         self.snipe_window = max(1.0, float(env("SNIPE_WINDOW_SECONDS", "10")))
         self.snipe_plan = None
         self.snipe_cancel = threading.Event()
@@ -1645,6 +1703,23 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         names = ", ".join(f"#{numbers.get(w, '?')} {short_address(w)}" for w in wallets)
         return f"{len(wallets)} of {len(self.minters)} ({names})"
 
+    def snipe_mode_text(self, plan):
+        extra = []
+        if self.snipe_tip_multiplier > 1:
+            extra.append(f"fee x{self.snipe_tip_multiplier:g}")
+        if self.rpc.extras if isinstance(self.rpc, RPC) else False:
+            extra.append(f"sent to {1 + len(self.rpc.extras.get(plan['chain'], []))} endpoint(s)")
+        tail = f" ({', '.join(extra)})" if extra else ""
+        if self.snipe_is_fast(plan):
+            return (
+                "⚡ Fast mode: signed ahead and sent at the start without checking the mint is open"
+                f"{tail}. A try that reverts is followed at once by another (every {self.snipe_retry:g}s) until the window ends.\n"
+            )
+        return (
+            "Nothing is broadcast while the contract reverts the mint. "
+            f"Once it accepts the call, a reverted transaction is retried every {self.snipe_retry:g}s until the window ends{tail}.\n"
+        )
+
     def snipe_plan_text(self, plan):
         chain = self.chains[plan["chain"]]
         seconds = max(0, int(plan["fire_at"] - time.time()))
@@ -1663,10 +1738,13 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             + f"Minters: {self.plan_wallets_text(plan)}\n"
             + ("".join(line + "\n" for line in plan.get("eligibility") or []))
             + f"Starts in: {fmt_duration(seconds)}" + (f" (at {plan['when']})" if plan.get("when") else "") + "\n"
-            f"Nothing is broadcast while the contract reverts the mint. "
-            f"Once it accepts the call, a reverted transaction is retried every {self.snipe_retry:g}s until the window ends.\n"
-            f"{gas_line}\n"
+            + self.snipe_mode_text(plan)
+            + f"{gas_line}\n"
             f"Worst case if a sent try fails: about {fmt_native(plan['worst'], plan['chain'])} in gas per minter\n"
+            + (
+                f"Ceiling if every try in the {self.snipe_window:g}s window reverts: about {fmt_native(plan['worst'] * plan['attempts'], plan['chain'])} per minter\n"
+                if self.snipe_is_fast(plan) else ""
+            )
             + ("Dry run is on: nothing will be sent\n" if self.dry else "")
             + "\nSend /snipe confirm to arm it, or /snipe cancel."
         )
@@ -1917,6 +1995,41 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             return first
         return None
 
+    def broadcast_raw(self, chain_id, raw):
+        """Send a signed transaction. With RPC_EXTRA_<chain> set, it goes to every endpoint at once."""
+        if isinstance(self.rpc, RPC) and self.rpc.extras.get(chain_id):
+            return self.rpc.broadcast(chain_id, raw)
+        return self.rpc.call(chain_id, "eth_sendRawTransaction", [raw])
+
+    def snipe_start(self, prepared, acct):
+        """(nonce, raw) already signed for this wallet, or (None, None)."""
+        return prepared.get(acct.address.lower(), (None, None))
+
+    def snipe_fees(self, chain_id):
+        """The fee and tip a snipe pays: the chain's current ones times SNIPE_TIP_MULTIPLIER."""
+        fee, tip = self.fees(chain_id)
+        mult = self.snipe_tip_multiplier
+        if mult > 1:
+            fee, tip = int(fee * mult), int(tip * mult)
+        return fee, min(tip, fee)
+
+    def snipe_is_fast(self, plan):
+        """Fast mode signs ahead and sends at the start without asking the contract first.
+
+        It needs one known mint call, so there is nothing to guess: a plan with several candidate calls, or one
+        that needs OpenSea to sign each wallet's mint, uses the checking mode instead.
+        """
+        if not self.setting("snipe_fast") or plan.get("immediate") or plan.get("phase_kind") == "signed":
+            return False
+        return len(plan.get("candidates") or []) == 1
+
+    def snipe_packed(self, plan, acct):
+        """(target, calldata) of the one mint call, for this wallet."""
+        signature, layout = plan["candidates"][0]
+        if plan.get("calldata") and layout == "seadrop":
+            return (plan.get("target") or SEADROP, plan["calldata"])
+        return (plan["contract"], self.snipe_call_data(signature, layout, plan["qty"], acct.address))
+
     def snipe_worker(self, acct, plan, nonce, fee, tip, first_raw, deadline, report):
         """Wait until the mint call succeeds, then send. A closed sale is not broadcast."""
         chain_id = plan["chain"]
@@ -1928,6 +2041,8 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             if last is None and raw is None and not plan.get("immediate") and self.snipe_cancel.is_set():
                 reason = "cancelled"
                 break
+            if last is None and raw is None and ready is None and plan.get("_fast", {}).get(who):
+                ready = plan["_fast"][who]  # fast mode: the call is known, so sign the next try at once
             if last is None and raw is None and ready is None:
                 ready = self.snipe_option(acct, plan)
                 if isinstance(ready, tuple) and ready and ready[0] == "stop":
@@ -1946,7 +2061,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                             if nonce is None:
                                 nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
                             raw = self.snipe_sign(chain_id, acct, plan, nonce, fee, tip, ready[0], ready[1])
-                        last = self.rpc.call(chain_id, "eth_sendRawTransaction", [raw])
+                        last = self.broadcast_raw(chain_id, raw)
                 except Exception as exc:
                     reason = f"sending failed: {str(exc)[:80]}"
                     log(f"snipe {acct.address[:8]} {reason}")
@@ -2000,7 +2115,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
         chain = self.chains[chain_id]
         report = {}
         try:
-            fee, tip = self.fees(chain_id)
+            fee, tip = self.snipe_fees(chain_id)
             active = []
             chosen = [a for a in self.minters if a.address.lower() in set(plan.get("wallets") or [x.address.lower() for x in self.minters])]
             for acct in chosen:
@@ -2018,8 +2133,24 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                     log(f"🧪 DRY snipe {acct.address} {plan['signature']} x{plan['qty']} on {chain.name}")
             else:
                 self.rpc.call(chain_id, "eth_chainId", [])  # keeps the connection warm
-                fee, tip = self.fees(chain_id)
-                if not immediate and not self.snipe_wait(plan["fire_at"]):
+                fee, tip = self.snipe_fees(chain_id)
+                prepared = {}
+                if self.snipe_is_fast(plan):
+                    plan["_fast"] = {}
+                    for acct in active:
+                        try:
+                            packed = self.snipe_packed(plan, acct)
+                            nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+                            raw = self.snipe_sign(chain_id, acct, plan, nonce, fee, tip, packed[0], packed[1])
+                        except Exception as exc:
+                            log(f"snipe presign {acct.address[:8]} {type(exc).__name__}")
+                            continue
+                        plan["_fast"][acct.address.lower()] = packed
+                        prepared[acct.address.lower()] = (nonce, raw)
+                start = plan["fire_at"] - self.snipe_early
+                if plan.get("phase_kind") == "signed":
+                    start -= self.snipe_poll_lead  # asking OpenSea early sends nothing until it hands back a mint
+                if not immediate and not self.snipe_wait(start):
                     return
                 deadline = plan["fire_at"] + self.snipe_window
                 drop_end = plan.get("drop_end")
@@ -2028,7 +2159,10 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                 # Do not hold _copy_lock across the wait. Each worker takes it only to sign and send.
                 with ThreadPoolExecutor(max_workers=max(1, len(active))) as pool:
                     jobs = [
-                        pool.submit(self.snipe_worker, acct, plan, None, fee, tip, None, deadline, report)
+                        pool.submit(
+                            self.snipe_worker, acct, plan, self.snipe_start(prepared, acct)[0], fee, tip,
+                            self.snipe_start(prepared, acct)[1], deadline, report,
+                        )
                         for acct in active
                     ]
                     for job in jobs:

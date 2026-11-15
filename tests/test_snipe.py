@@ -550,7 +550,7 @@ class PublicDrop(unittest.TestCase):
         b.public_drop = lambda *a, **k: drop
         text = b.command_reply("/snipe", [CONTRACT, "1", "open"])
         self.assertIn("mintPublic", text)
-        self.assertIn("Nothing is broadcast", text)
+        self.assertIn("Fast mode", text)
         self.assertEqual(b.snipe_plan["fire_at"], drop["start"])
         self.assertEqual(b.snipe_plan["target"], bot.SEADROP)
         self.assertEqual(b.snipe_plan["value"], drop["price"])
@@ -730,3 +730,149 @@ class EligibilityLines(unittest.TestCase):
         self.assertIn("⛔", text)
         self.assertIn("not eligible", text)
         self.assertEqual(b.snipe_plan["wallets"], [a1.address.lower()])
+
+
+class FastMode(unittest.TestCase):
+    def fast_bot(self, receipts):
+        b = node(make_bot())
+        b.settings["snipe_fast"] = True
+        b.ensure = lambda acct, chain_id, need: True
+        original = b.rpc.call.side_effect
+        log = {"methods": [], "sent": []}
+        queue = list(receipts)
+
+        def call(chain_id, method, params):
+            log["methods"].append(method)
+            if method == "eth_sendRawTransaction":
+                log["sent"].append(params[0])
+                return f"0xtx{len(log['sent'])}"
+            if method == "eth_getTransactionReceipt":
+                return queue.pop(0) if queue else None
+            return original(chain_id, method, params)
+
+        b.rpc.call.side_effect = call
+        return b, log
+
+    def plan(self, b, candidates):
+        plan = sample_plan(b)
+        plan["candidates"] = candidates
+        plan["fire_at"] = bot.time.time() + 0.3
+        return plan
+
+    def test_one_known_call_is_signed_ahead_and_sent_without_asking_the_contract(self):
+        ok = {"status": "0x1", "gasUsed": hex(50_000), "effectiveGasPrice": hex(10**9), "logs": []}
+        b, log = self.fast_bot([ok, ok])
+        plan = self.plan(b, [("mint(uint256)", "q")])
+        with mock.patch.object(bot, "SNIPE_PREP_SECONDS", 0), mock.patch.object(bot, "notify"), mock.patch.object(bot, "log"):
+            self.assertTrue(b.snipe_is_fast(plan))
+            b.run_snipe(plan)
+        self.assertNotIn("eth_call", log["methods"][: log["methods"].index("eth_sendRawTransaction")])
+        self.assertEqual(len(log["sent"]), 2)
+        self.assertLess(log["methods"].index("eth_getTransactionCount"), log["methods"].index("eth_sendRawTransaction"))
+
+    def test_a_reverted_try_is_followed_at_once_by_another_with_the_next_nonce(self):
+        reverted = {"status": "0x0", "gasUsed": hex(50_000), "effectiveGasPrice": hex(10**9)}
+        ok = {"status": "0x1", "gasUsed": hex(50_000), "effectiveGasPrice": hex(10**9), "logs": []}
+        b, log = self.fast_bot([reverted, ok])
+        b.minters = b.minters[:1]
+        plan = self.plan(b, [("mint(uint256)", "q")])
+        plan["wallets"] = [b.minters[0].address.lower()]
+        with mock.patch.object(bot, "SNIPE_PREP_SECONDS", 0), mock.patch.object(bot, "notify"), mock.patch.object(bot, "log"):
+            b.run_snipe(plan)
+        self.assertEqual(len(log["sent"]), 2)
+        second = [i for i, m in enumerate(log["methods"]) if m == "eth_sendRawTransaction"][1]
+        self.assertNotIn("eth_call", log["methods"][:second])  # no open-check between the revert and the next try
+        self.assertNotEqual(log["sent"][0], log["sent"][1])
+
+    def test_several_candidate_calls_keep_the_checking_mode(self):
+        b, _log = self.fast_bot([])
+        plan = self.plan(b, [("mint(uint256)", "q"), ("publicMint(uint256)", "q")])
+        self.assertFalse(b.snipe_is_fast(plan))
+        plan = self.plan(b, [("mint(uint256)", "q")])
+        plan["phase_kind"] = "signed"
+        self.assertFalse(b.snipe_is_fast(plan))
+        b.settings["snipe_fast"] = False
+        self.assertFalse(b.snipe_is_fast(self.plan(b, [("mint(uint256)", "q")])))
+
+    def test_tip_multiplier_raises_the_fee(self):
+        b, _log = self.fast_bot([])
+        self.assertEqual(b.snipe_fees(4663), (2 * 10**9, 10**9))
+        b.snipe_tip_multiplier = 3.0
+        self.assertEqual(b.snipe_fees(4663), (6 * 10**9, 3 * 10**9))
+
+
+class RpcTransport(unittest.TestCase):
+    def serve(self, handler_cls):
+        import http.server
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def handler(self, hits, fail=False, delay=0.0):
+        import http.server
+        import json as _json
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                body = _json.loads(self.rfile.read(int(self.headers["content-length"])))
+                hits.append((self.client_address[1], body["method"]))
+                if delay:
+                    bot.time.sleep(delay)
+                if fail:
+                    out = _json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"message": "nope"}}).encode()
+                else:
+                    out = _json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xabc"}).encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *a):
+                pass
+
+        return Handler
+
+    def test_connections_are_reused(self):
+        hits = []
+        url = self.serve(self.handler(hits))
+        rpc = bot.RPC({1: bot.Chain(1, "T", url)})
+        for _ in range(5):
+            self.assertEqual(rpc.call(1, "eth_chainId", []), "0xabc")
+        self.assertEqual(len({port for port, _ in hits}), 1)
+
+    def test_a_dropped_connection_is_retried_once_on_a_new_one(self):
+        hits = []
+        url = self.serve(self.handler(hits))
+        rpc = bot.RPC({1: bot.Chain(1, "T", url)})
+        rpc.call(1, "eth_chainId", [])
+        list(rpc._local.pool.values())[0].sock.close()  # the server side went away
+        self.assertEqual(rpc.call(1, "eth_chainId", []), "0xabc")
+
+    def test_error_bodies_and_statuses_still_raise(self):
+        url = self.serve(self.handler([], fail=True))
+        rpc = bot.RPC({1: bot.Chain(1, "T", url)})
+        with self.assertRaises(RuntimeError):
+            rpc.call(1, "eth_sendRawTransaction", ["0x"])
+
+    def test_broadcast_goes_to_every_endpoint_and_the_first_success_wins(self):
+        slow, fast, broken = [], [], []
+        a = self.serve(self.handler(slow, delay=0.4))
+        c = self.serve(self.handler(fast))
+        d = self.serve(self.handler(broken, fail=True))
+        rpc = bot.RPC({1: bot.Chain(1, "T", a)}, {1: [c, d]})
+        started = bot.time.time()
+        self.assertEqual(rpc.broadcast(1, "0xraw"), "0xabc")
+        self.assertLess(bot.time.time() - started, 0.35)  # did not wait for the slow primary
+        bot.time.sleep(0.6)
+        self.assertEqual([m for _, m in slow + fast + broken], ["eth_sendRawTransaction"] * 3)
+
+    def test_broadcast_raises_when_every_endpoint_refuses(self):
+        a = self.serve(self.handler([], fail=True))
+        b = self.serve(self.handler([], fail=True))
+        rpc = bot.RPC({1: bot.Chain(1, "T", a)}, {1: [b]})
+        with self.assertRaises(RuntimeError):
+            rpc.broadcast(1, "0xraw")

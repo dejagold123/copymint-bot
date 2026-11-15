@@ -111,7 +111,11 @@ Set these in Railway → Service → Variables (or in a local `.env` when you ru
 | `WSS_BACKUP_SCAN` | `false`. Also rescan blocks for mint logs on that tick (costs far more on a fast chain) |
 | `LOGS_MAX_BLOCKS` | `10`, the most Alchemy's free plan allows per `eth_getLogs`. Raise it on a paid plan |
 | `SNIPE_WINDOW_SECONDS` | `10`. How long `/snipe` keeps trying after the start |
-| `SNIPE_RETRY_SECONDS` | `0.5`. Gap between `/snipe` tries |
+| `SNIPE_RETRY_SECONDS` | `0.1`. Gap between `/snipe` tries (lowest `0.02`). Lower is faster but needs an RPC plan that allows the request rate |
+| `SNIPE_TIP_MULTIPLIER` | `1`. Multiplies the fee and tip a `/snipe` pays (up to `20`). Useful on chains where the fee decides the order |
+| `SNIPE_FIRE_EARLY_MS` | `0`. Starts a fast-mode snipe this many milliseconds before the open time, to cover network delay (up to `2000`) |
+| `SNIPE_POLL_LEAD_SECONDS` | `2`. For OpenSea-signed phases, starts asking OpenSea this many seconds before the open. Nothing is sent until OpenSea hands back a mint |
+| `RPC_EXTRA_<chainId>` | Extra RPC URLs for that chain, comma-separated. A `/snipe` sends each signed transaction to all of them at once and the first to accept wins |
 | `OPENSEA_API_KEY` | Needed for `/buy`, `/sweep`, `/list`, `/sellall`, `/offer`, auto-list, OpenSea names and the OpenSea part of `/sendnfts`. Get one from OpenSea's developer settings |
 | `MAX_BUY_ETH` | `0.05`. The most one OpenSea purchase or offer may cost. `max=` in a command can only go below it |
 | `SWEEP_POLL_SECONDS` | `5`. How often a sweep re-reads listings |
@@ -196,6 +200,7 @@ Change with `/settings KEY VALUE`, restore with `/settings reset KEY`. They are 
 | `autolist_seconds` | 60 | How often listings are checked |
 | `premint_min_sales` | 0 | Skip copying a collection OpenSea knows with fewer sales than this (new collections always pass) |
 | `opensea_names` | on | Use OpenSea collection names in alerts |
+| `snipe_fast` | on | `/snipe` signs ahead and sends at the start without checking the mint is open. Only used when there is one known mint call |
 | `stream` | on | Use OpenSea's live feed to wake `/sweep` the moment a listing appears |
 | `collect` | off | Switched with `/collect on` and `/collect off` |
 | `collect_percent` | 40 | Share of the wallet's whole balance sent on when a deposit lands |
@@ -216,6 +221,18 @@ Every copy is simulated first, using `eth_simulateV1` or `debug_traceCall`. Publ
 ### WebSocket mode
 
 Set `WSS_<chainId>` to your provider's `wss://` URL and the bot subscribes to mint logs for your watched wallets instead of waiting for the next poll. While a socket is live it only checks the latest block number now and then. If the socket drops, it scans the missed blocks once and polls at full speed until it is back. Look for `<chain> websocket live` in the logs. Chains without a `WSS_` variable just poll.
+
+### Fast sniping
+
+`/snipe` has a fast mode, on by default (`/settings snipe_fast off` to disable). When the plan has one known mint call, it:
+
+1. signs every minter's transaction ahead of time with its nonce reserved;
+2. sends it at the start time without first asking the contract whether the mint is open, to every endpoint at once if you set `RPC_EXTRA_<chainId>`;
+3. after a try that reverts, signs and sends the next one at once, every `SNIPE_RETRY_SECONDS`, until `SNIPE_WINDOW_SECONDS` ends.
+
+Connections to your RPC stay open between calls, so a send does not pay for a new TLS handshake. A try that is sent early reverts and costs gas, so the plan shows the cost of one failed try and the ceiling if every try in the window fails. If a plan has several possible mint calls, or needs OpenSea to sign each wallet's mint, the bot uses the checking mode instead and says so in the plan. For OpenSea-signed phases, `SNIPE_POLL_LEAD_SECONDS` starts asking OpenSea a couple of seconds early.
+
+What decides the race is mostly outside the code: a fast, paid RPC close to the chain, a Railway region near it, funded minters (so nothing bridges mid-mint), and on chains where fees set the order, `SNIPE_TIP_MULTIPLIER`. This makes the bot as fast as its infrastructure allows, but professional bots on their own nodes can still beat it.
 
 ### OpenSea buying and selling
 

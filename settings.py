@@ -24,6 +24,7 @@ SPEC = {
     "collect": ("bool", False, None, None, "Forward part of each deposit to COLLECT_TO (use /collect on)"),
     "collect_percent": ("float", 40.0, 1.0, 100.0, "Percent of the wallet's whole balance forwarded when a deposit lands; the rest stays"),
     "collect_minimum": ("amount", "0", None, None, "Ignore deposits smaller than this, in the chain's coin"),
+    "snipe_fast": ("bool", True, None, None, "/snipe signs ahead and sends at the start without checking the mint is open (single known mint call only)"),
     "stream": ("bool", True, None, None, "Use OpenSea's live feed to wake /sweep the moment a listing appears"),
 }
 
