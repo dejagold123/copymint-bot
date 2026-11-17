@@ -1965,7 +1965,12 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
             tx, err = self.fetch_phase_tx(plan["chain"], plan["contract"], acct, plan["qty"], plan.get("stage") or {})
             if tx and tx[0] == plan.get("value"):
                 return (tx[1], tx[2])
-            if err and any(word in err.lower() for word in ("not minting", "not ready", "could not ask")):
+            if err and any(word in err.lower() for word in ("not minting", "not ready", "could not ask", "refused")):
+                if "refused" in err.lower():
+                    plan.setdefault("_last_err", {})[acct.address.lower()] = err
+                return None
+            # Before the phase opens OpenSea can answer "not eligible" for a wallet that is eligible. Never give up early.
+            if err and "not eligible" in err.lower() and time.time() < plan["fire_at"] + 5:
                 return None
             if err:
                 return ("stop", err)
@@ -2050,7 +2055,7 @@ class Bot(TradeMixin, SendMixin, SettingsMixin, MarketMixin, EasyMixin, HistoryM
                     break
                 if ready is None:
                     if time.time() >= deadline:
-                        reason = "the mint call reverted the whole time, so nothing was sent"
+                        reason = (plan.get("_last_err") or {}).get(who) or "the mint call reverted the whole time, so nothing was sent"
                         break
                     time.sleep(self.snipe_retry)
                     continue

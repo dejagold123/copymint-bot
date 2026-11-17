@@ -248,7 +248,8 @@ def mint_call_from_action(body, chain_id, chain_slug, nft, expected_value, seadr
     if any("Eligib" in name or "Allow" in name for name in errors):
         return None, "not eligible for this phase"
     if errors:
-        return None, "not eligible for this phase"
+        # An error name this bot does not know is not proof the wallet is ineligible. Keep the name so it shows up.
+        return None, "OpenSea refused the mint (" + ", ".join(sorted(set(errors))[:3]) + ")"
     return None, "not minting yet"
 
 

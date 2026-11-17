@@ -113,6 +113,12 @@ class MintAction(unittest.TestCase):
         self.assertEqual(phases.mint_call_from_action(waiting, 1, "ethereum", "0x" + "ab" * 20, 0, bot.SEADROP)[1], "not minting yet")
         self.assertIn("no mints", phases.mint_call_from_action(blocked, 1, "ethereum", "0x" + "ab" * 20, 0, bot.SEADROP)[1])
 
+    def test_an_unknown_error_name_is_not_called_not_eligible(self):
+        odd = {"data": {"swap": {"actions": [], "errors": [{"__typename": "SomethingNewError"}]}}}
+        err = phases.mint_call_from_action(odd, 1, "ethereum", "0x" + "ab" * 20, 0, bot.SEADROP)[1]
+        self.assertNotIn("not eligible", err)
+        self.assertIn("SomethingNewError", err)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -794,6 +794,24 @@ class FastMode(unittest.TestCase):
         b.settings["snipe_fast"] = False
         self.assertFalse(b.snipe_is_fast(self.plan(b, [("mint(uint256)", "q")])))
 
+    def test_a_signed_phase_never_gives_up_before_it_opens(self):
+        b, _log = self.fast_bot([])
+        plan = self.plan(b, [("mint(uint256)", "q")])
+        plan["phase_kind"] = "signed"
+        acct = b.minters[0]
+        # OpenSea says "not eligible" five seconds before the phase opens: keep trying, do not stop
+        plan["fire_at"] = bot.time.time() + 5
+        with mock.patch.object(b, "fetch_phase_tx", return_value=(None, "not eligible for this phase")):
+            self.assertIsNone(b.snipe_option(acct, plan))
+        # an error name nobody knows is retried, and remembered for the report
+        with mock.patch.object(b, "fetch_phase_tx", return_value=(None, "OpenSea refused the mint (NewError)")):
+            self.assertIsNone(b.snipe_option(acct, plan))
+        self.assertIn("NewError", plan["_last_err"][acct.address.lower()])
+        # well after the open, a plain "not eligible" still stops that wallet
+        plan["fire_at"] = bot.time.time() - 30
+        with mock.patch.object(b, "fetch_phase_tx", return_value=(None, "not eligible for this phase")):
+            self.assertEqual(b.snipe_option(acct, plan)[0], "stop")
+
     def test_tip_multiplier_raises_the_fee(self):
         b, _log = self.fast_bot([])
         self.assertEqual(b.snipe_fees(4663), (2 * 10**9, 10**9))
